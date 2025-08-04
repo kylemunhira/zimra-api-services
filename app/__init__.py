@@ -29,7 +29,8 @@ def create_app():
     app.register_blueprint(api, url_prefix='/api')
 
     from .models import FiscalDay 
-    from .models import DeviceInfo 
+    from .models import DeviceInfo
+    from .models import DeviceConfiguration 
 
     with app.app_context():
         db.create_all()  # create tables here

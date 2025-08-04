@@ -1,5 +1,5 @@
 from flask import Blueprint, jsonify, request, current_app, send_from_directory, render_template_string
-from app.models import DeviceInfo, FiscalDay, Invoice, InvoiceLineItem, DeviceBranchAddress, DeviceBranchContact
+from app.models import DeviceInfo, FiscalDay, Invoice, InvoiceLineItem, DeviceBranchAddress, DeviceBranchContact, DeviceConfiguration
 from app import db
 from utils.close_day_string_utilts import generate_close_day_string, add_zeros
 from utils.date_utils import  get_close_day_string_date
@@ -10,7 +10,7 @@ from utils.invoice_utils import (
     calculate_total_sales_amount_with_tax, create_invoice_line_items, create_invoice,
     update_fiscalized_invoice, qr_string_generator, base64_to_hex_md5, get_device_config,
     qr_date, receipt_date_print, get_fiscal_day_open_date_time, get_previous_hash,
-    get_credit_debit_note_invoice
+    get_credit_debit_note_invoice, ReceiptDeviceSignature, read_pem_file
 )
 from datetime import datetime
 from enum import Enum
@@ -25,6 +25,7 @@ import os
 import logging
 import json
 import urllib3
+import hashlib
 
 
 # Disable SSL warnings for testing
@@ -65,15 +66,54 @@ def get_fiscal_number(device_id: str) -> int:
 
 def get_device_config(device_id):
     """
-    Replace this with actual DB call or ORM fetch.
+    Get device configuration from database and return with certificate/key paths.
     """
-    # Simulate data (would come from DB in real-world case)
-    return {
-        "certificate": os.path.abspath(f"certs/{device_id}.pem"),
-        "key": os.path.abspath(f"certs/{device_id}.key"),
-        "model_name": "Server",
-        "model_version_number": "v1"
+    # Get device info for certificate and key paths
+    device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+    if not device:
+        # Fallback to hardcoded paths if device not found
+        return {
+            "certificate": os.path.abspath(f"certs/{device_id}.pem"),
+            "key": os.path.abspath(f"certs/{device_id}.key"),
+            "model_name": "Server",
+            "model_version_number": "v1"
+        }
+    
+    # Get device configuration from database
+    device_config = DeviceConfiguration.query.filter_by(device_id=str(device_id)).first()
+    
+    config_data = {
+        "certificate": device.certificate_path,
+        "key": device.key_path,
+        "model_name": device.model_name or "Server",
+        "model_version_number": device.model_version or "v1"
     }
+    
+    # Add configuration data if available
+    if device_config:
+        config_data.update({
+            "taxPayerName": device_config.tax_payer_name,
+            "taxPayerTIN": device_config.tax_payer_tin,
+            "vatNumber": device_config.vat_number,
+            "deviceSerialNo": device_config.device_serial_no,
+            "deviceBranchName": device_config.device_branch_name,
+            "deviceBranchAddress": {
+                "province": device_config.device_branch_address_province,
+                "city": device_config.device_branch_address_city,
+                "street": device_config.device_branch_address_street,
+                "houseNo": device_config.device_branch_address_house_no
+            },
+            "deviceBranchContacts": {
+                "phoneNo": device_config.device_branch_contacts_phone_no,
+                "email": device_config.device_branch_contacts_email
+            },
+            "deviceOperatingMode": device_config.device_operating_mode,
+            "taxPayerDayMaxHrs": device_config.tax_payer_day_max_hrs,
+            "qrUrl": device_config.qr_url,
+            "operationID": device_config.operation_id
+        })
+    
+    return config_data
 
 
 def get_submit_receipt_date():
@@ -388,7 +428,7 @@ def submit_receipt(device_id):
     try:
         # 1. Read and validate posted JSON
         posted_data = request.get_json()
-        current_app.logger.debug(f"Received SubmitReceipt payload: {posted_data}")
+        #current_app.logger.debug(f"Received SubmitReceipt payload: {posted_data}")
         
         # Check if payload has nested receipt structure
         if "receipt" in posted_data:
@@ -444,10 +484,13 @@ def submit_receipt(device_id):
         updated_data['receiptCounter'] = counter + 1
 
         global_number = get_global_number(str(device_id))
-        if global_number != -1:
-            updated_data['receiptGlobalNo'] = global_number + 1
-        else:
+        if global_number is None:
+            # If no previous invoices exist, start with 0
+            global_number = 0
+        elif global_number < 0:
             return jsonify({"error": "Global Value cannot be negative"}), 400
+        
+        updated_data['receiptGlobalNo'] = global_number + 1
 
         # 7. Calculate tax summary with enhanced logic
         tax_summary = calculate_tax_summary(updated_data.get('receiptLines', []))
@@ -465,48 +508,28 @@ def submit_receipt(device_id):
         updated_data['receiptTotal'] = receipt_total
         updated_data['receiptTaxes'] = filtered_taxes
 
-        # 8. Generate string to sign with previous hash if available
-        string_to_sign = generate_receipt_string(
-            device_id=str(device_id),
-            receipt_number=str(updated_data['invoiceNo']),
-            receipt_date_time=updated_data['receiptDate'],
-            receipt_amount=str(receipt_total),
-            receipt_tax_amount="0",  # Will be calculated from taxes
-            receipt_total_amount=str(receipt_total)
-        )
+        # 8. Generate string to sign with previous hash if available using new method
+        string_to_sign = generator_invoice_string(str(device_id), updated_data, filtered_taxes)
 
         if previous_receipt_hash != '':
             string_to_sign = string_to_sign + str(previous_receipt_hash)
-
+        current_app.logger.debug(f"#################################################123")
+        current_app.logger.debug(f"Previous receipt hash: {previous_receipt_hash}")
+        current_app.logger.debug(f"#################################################123")
         current_app.logger.debug(f"String to sign for SubmitReceipt: {string_to_sign}")
+        current_app.logger.debug(f"#################################################123")
 
-        # 9. Generate signature
-        with open(key_path, 'rb') as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=None
-            )
+        # 9. Generate signature using ReceiptDeviceSignature class
+        private_key = read_pem_file(key_path)
+        receipt_device_signature_obj = ReceiptDeviceSignature(string_to_sign, private_key)
         
-        signature = private_key.sign(
-            string_to_sign.encode('utf-8'),
-            padding.PKCS1v15(),
-            hashes.SHA256()
-        )
-        
-        receipt_device_signature = base64.b64encode(signature).decode('utf-8')
-        
-        # 10. Create signature object
-        hash_obj = hashes.Hash(hashes.SHA256())
-        hash_obj.update(string_to_sign.encode('utf-8'))
-        hash_value = hash_obj.finalize()
-        
-        receipt_device_signature_obj = {
-            "hash": base64.b64encode(hash_value).decode('utf-8'),
-            "signature": receipt_device_signature
+        receipt_device_signature_obj_data = {
+            "hash": receipt_device_signature_obj.get_hash(),
+            "signature": receipt_device_signature_obj.sign_data()
         }
         
         # 11. Add signature to receipt data
-        updated_data['receiptDeviceSignature'] = receipt_device_signature_obj
+        updated_data['receiptDeviceSignature'] = receipt_device_signature_obj_data
         
         # 12. Prepare full payload
         full_payload = {
@@ -523,14 +546,14 @@ def submit_receipt(device_id):
             "DeviceModelName": device.model_name,
             "DeviceModelVersion": device.model_version
         }
-
+        return jsonify(full_payload), 200
         # 14. Send request to ZIMRA
         url = f'https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/SubmitReceipt'
         json_data = json.dumps(full_payload)
         current_app.logger.debug(f"SubmitReceipt Payload: {json_data}")
-        
+ 
         response = session.post(url, data=json_data, headers=headers, verify=False)
-        current_app.logger.debug(f"ZIMRA SubmitReceipt status: {response.status_code}")
+        #current_app.logger.debug(f"ZIMRA SubmitReceipt status: {response.content}")
         
         # 15. Process successful response
         if response.status_code == 200:
@@ -538,7 +561,8 @@ def submit_receipt(device_id):
             current_app.logger.debug(f"ZIMRA Response: {zimra_response}")
             
             try:
-                # Get device configuration
+                # Get device configuration from database
+                device_config = DeviceConfiguration.query.filter_by(device_id=str(device_id)).first()
                 config_data = get_device_config(str(device_id))
                 
                 # Create invoice data
@@ -555,17 +579,22 @@ def submit_receipt(device_id):
                 # Create invoice in database
                 created_invoice = create_invoice(invoice_data)
                 
-                # Generate QR code
+                # Generate QR code using stored QR URL from device config
+                qr_url = device_config.qr_url if device_config and device_config.qr_url else "https://fdmstest.zimra.co.zw/"
                 qr_string = qr_string_generator(
                     device_id=str(device_id),
-                    qr_url="https://fdmstest.zimra.co.zw/",
+                    qr_url=qr_url,
                     receipt_date=qr_date(),
                     reciept_global_no=global_number + 1,
-                    reciept_signature=receipt_device_signature
+                    reciept_signature=receipt_device_signature_obj.sign_data()
                 )
                 
                 # Generate verification code
-                verification_string = base64_to_hex_md5(receipt_device_signature)
+                verification_string = base64_to_hex_md5(receipt_device_signature_obj.sign_data())
+
+                current_app.logger.debug(f"#################################################")
+                current_app.logger.debug(f"ZIMRA Response: {verification_string}")
+                current_app.logger.debug(f"#################################################")
                 
                 # Handle credit/debit note logic
                 debit_credit_note_invoice_ref = None
@@ -583,25 +612,33 @@ def submit_receipt(device_id):
                     else:
                         debit_credit_note_invoice_ref = str(updated_data['creditDebitNote']['receiptID'])
                 
-                # Prepare update data
+                # Prepare update data using stored device configuration
                 update_data = {
                     'invoice_id': updated_data['invoiceNo'],
                     'zimra_receipt_number': str(zimra_response.get('receiptID', '')),
                     'operation_id': str(zimra_response.get('operationID', '')),
                     'qr_code_string': qr_string,
                     'verification_number': verification_string,
-                    'hash_string': receipt_device_signature_obj['hash'],
+                    'hash_string': receipt_device_signature_obj.get_hash(),
                     'is_fiscalized': True,
                     'receipt_counter': counter + 1,
                     'receipt_global_no': global_number + 1,
                     'fiscal_day_number': str(open_fiscal_day.fiscal_day_no),
                     'receipt_notes': updated_data.get('receiptNotes', ''),
-                    'tax_payer_name': config_data.get('taxPayerName', ''),
-                    'tax_payer_tin': str(config_data.get('taxPayerTIN', '')),
-                    'vat_number': str(config_data.get('vatNumber', '')),
-                    'device_branch_name': str(config_data.get('deviceBranchName', '')),
-                    'device_branch_address': config_data.get('deviceBranchAddress', {}),
-                    'device_branch_contact': config_data.get('deviceBranchContacts', {}),
+                    'tax_payer_name': device_config.tax_payer_name if device_config else config_data.get('taxPayerName', ''),
+                    'tax_payer_tin': str(device_config.tax_payer_tin if device_config else config_data.get('taxPayerTIN', '')),
+                    'vat_number': str(device_config.vat_number if device_config else config_data.get('vatNumber', '')),
+                    'device_branch_name': str(device_config.device_branch_name if device_config else config_data.get('deviceBranchName', '')),
+                    'device_branch_address': {
+                        'province': device_config.device_branch_address_province if device_config else config_data.get('deviceBranchAddress', {}).get('province', ''),
+                        'city': device_config.device_branch_address_city if device_config else config_data.get('deviceBranchAddress', {}).get('city', ''),
+                        'street': device_config.device_branch_address_street if device_config else config_data.get('deviceBranchAddress', {}).get('street', ''),
+                        'houseNo': device_config.device_branch_address_house_no if device_config else config_data.get('deviceBranchAddress', {}).get('houseNo', '')
+                    },
+                    'device_branch_contact': {
+                        'phoneNo': device_config.device_branch_contacts_phone_no if device_config else config_data.get('deviceBranchContacts', {}).get('phoneNo', ''),
+                        'email': device_config.device_branch_contacts_email if device_config else config_data.get('deviceBranchContacts', {}).get('email', '')
+                    },
                     'debit_credit_note_invoice_ref': debit_credit_note_invoice_ref,
                     'debit_credit_note_invoice_ref_date': debit_credit_note_invoice_ref_date
                 }
@@ -609,17 +646,25 @@ def submit_receipt(device_id):
                 # Update invoice with fiscalization data
                 update_fiscalized_invoice(update_data)
                 
-                # Prepare response data
+                # Prepare response data using stored device configuration
                 response_data = {
-                    "taxPayerName": config_data.get('taxPayerName', ''),
-                    "taxPayerTIN": config_data.get('taxPayerTIN', ''),
-                    "vatNumber": config_data.get('vatNumber', ''),
-                    "deviceBranchName": config_data.get('deviceBranchName', ''),
-                    "deviceBranchAddress": config_data.get('deviceBranchAddress', {}),
-                    "deviceBranchContacts": config_data.get('deviceBranchContacts', {}),
+                    "taxPayerName": device_config.tax_payer_name if device_config else config_data.get('taxPayerName', ''),
+                    "taxPayerTIN": device_config.tax_payer_tin if device_config else config_data.get('taxPayerTIN', ''),
+                    "vatNumber": device_config.vat_number if device_config else config_data.get('vatNumber', ''),
+                    "deviceBranchName": device_config.device_branch_name if device_config else config_data.get('deviceBranchName', ''),
+                    "deviceBranchAddress": {
+                        "province": device_config.device_branch_address_province if device_config else config_data.get('deviceBranchAddress', {}).get('province', ''),
+                        "city": device_config.device_branch_address_city if device_config else config_data.get('deviceBranchAddress', {}).get('city', ''),
+                        "street": device_config.device_branch_address_street if device_config else config_data.get('deviceBranchAddress', {}).get('street', ''),
+                        "houseNo": device_config.device_branch_address_house_no if device_config else config_data.get('deviceBranchAddress', {}).get('houseNo', '')
+                    },
+                    "deviceBranchContacts": {
+                        "phoneNo": device_config.device_branch_contacts_phone_no if device_config else config_data.get('deviceBranchContacts', {}).get('phoneNo', ''),
+                        "email": device_config.device_branch_contacts_email if device_config else config_data.get('deviceBranchContacts', {}).get('email', '')
+                    },
                     "taxCode": "A",
-                    "qrUrl": config_data.get('qrUrl', 'https://fdmstest.zimra.co.zw/'),
-                    "deviceSerialNo": config_data.get('deviceSerialNo', ''),
+                    "qrUrl": device_config.qr_url if device_config and device_config.qr_url else config_data.get('qrUrl', 'https://fdmstest.zimra.co.zw/'),
+                    "deviceSerialNo": device_config.device_serial_no if device_config else config_data.get('deviceSerialNo', ''),
                     "receiptCounter": counter + 1,
                     "receiptGlobalNo": global_number + 1,
                     "fiscalDayNumber": str(open_fiscal_day.fiscal_day_no),
@@ -682,6 +727,133 @@ def generate_receipt_string(device_id: str, receipt_number: str, receipt_date_ti
     return concatenated_string.upper()
 
 
+def generator_invoice_string(device_id: str, receipt: dict, taxes: list) -> str:
+    """
+    Generates the string to sign for SubmitReceipt using the new format with tax details.
+    
+    Parameters:
+        device_id (str): The device identifier
+        receipt (dict): The receipt data
+        taxes (list): List of tax items
+    
+    Returns:
+        str: Concatenated string ready for signing
+    """
+    generated_dict = extract_invoice_string_first_part(device_id, receipt)
+    concat_string = concat_helper_invoice_string(generated_dict)
+
+    return concat_string.upper() + get_concatenated_string_second_part(taxes)
+
+
+def get_concatenated_string_second_part(data):
+    """
+    Generates the second part of the invoice string from tax data.
+    
+    Parameters:
+        data (list): List of tax items
+    
+    Returns:
+        str: Concatenated tax string
+    """
+    result = ""
+    for item in data:
+        if 'taxPercent' not in item:
+            tax_percent_formatted = ""
+            tax_amount_cents = round(item['taxAmount'] * 100)
+            sales_amount_cents = round(item['salesAmountWithTax'] * 100)
+            result = result + str(item['taxCode']) + str(tax_percent_formatted) + str(tax_amount_cents) + str(sales_amount_cents)
+        else:
+            tax_percent_formatted = f"{float(item['taxPercent']):.2f}"
+            tax_amount_cents = round(item['taxAmount'] * 100)
+            sales_amount_cents = round(item['salesAmountWithTax'] * 100)
+            result = result + str(item['taxCode']) + str(tax_percent_formatted) + str(tax_amount_cents) + str(sales_amount_cents)
+
+    return result.upper()
+
+
+def extract_invoice_string_first_part(device_id: str, receipt: dict) -> dict:
+    """
+    Extracts the first part of the invoice string from receipt data.
+    
+    Parameters:
+        device_id (str): The device identifier
+        receipt (dict): The receipt data
+    
+    Returns:
+        dict: Dictionary with extracted values
+    """
+    # Handle both nested and flat receipt structures
+    if 'receipt' in receipt:
+        receipt_data = receipt['receipt']
+    else:
+        receipt_data = receipt
+    
+    extracted_dict = {
+        "device_id": device_id,
+        "receiptType": receipt_data['receiptType'],
+        "receiptCurrency": receipt_data['receiptCurrency'],
+        "receiptGlobalNo": receipt_data['receiptGlobalNo'],
+        "receiptDate": receipt_data['receiptDate'],
+        "receiptTotal": str(round(receipt_data['receiptTotal']*100)).replace(".00","").replace(".0","")
+    }
+
+    return extracted_dict
+
+
+def concat_helper_invoice_string(receipt: dict) -> str:
+    """
+    Concatenates the values from the receipt dictionary.
+    
+    Parameters:
+        receipt (dict): The receipt dictionary
+    
+    Returns:
+        str: Concatenated string
+    """
+    concatenated_values = ""
+    for value in receipt.values():
+        if isinstance(value, list):
+            for item in value:
+                concatenated_values += item + ""
+        else:
+            concatenated_values += str(value) + ""
+
+    return concatenated_values
+
+
+def add_zeros(value):
+    """
+    Formats a value to have 2 decimal places.
+    
+    Parameters:
+        value: The value to format
+    
+    Returns:
+        str: Formatted value
+    """
+    if isinstance(value, int):
+        return f"{value:.2f}"
+    else:
+        return value
+
+
+def add_leading_zeros_zfill(number, target_length) -> str:
+    """
+    Adds leading zeros to a number to reach the target length.
+    
+    Parameters:
+        number: The number to format
+        target_length (int): The target length
+    
+    Returns:
+        str: Formatted number with leading zeros
+    """
+    return str(number).zfill(target_length)
+
+
+
+
+
 @api.route('/get_config/<device_id>', methods=['GET'])
 def get_config(device_id):
     try:
@@ -728,13 +900,120 @@ def get_config(device_id):
         
         current_app.logger.debug(f"GetConfig body: {response}")
         if response.status_code == 200:
-            return jsonify(response.json()), 200
+            # Parse the response data
+            config_data = response.json()
+            
+            # Save or update device configuration in database
+            device_config_record = DeviceConfiguration.query.filter_by(device_id=str(device_id)).first()
+            
+            if device_config_record:
+                # Update existing record
+                device_config_record.tax_payer_name = config_data.get('taxPayerName')
+                device_config_record.tax_payer_tin = config_data.get('taxPayerTIN')
+                device_config_record.vat_number = config_data.get('vatNumber')
+                device_config_record.device_serial_no = config_data.get('deviceSerialNo')
+                device_config_record.device_branch_name = config_data.get('deviceBranchName')
+                device_config_record.device_operating_mode = config_data.get('deviceOperatingMode')
+                device_config_record.tax_payer_day_max_hrs = config_data.get('taxPayerDayMaxHrs')
+                device_config_record.qr_url = config_data.get('qrUrl')
+                device_config_record.operation_id = config_data.get('operationID')
+                
+                # Address information
+                if config_data.get('deviceBranchAddress'):
+                    address = config_data['deviceBranchAddress']
+                    device_config_record.device_branch_address_province = address.get('province')
+                    device_config_record.device_branch_address_city = address.get('city')
+                    device_config_record.device_branch_address_street = address.get('street')
+                    device_config_record.device_branch_address_house_no = address.get('houseNo')
+                
+                # Contact information
+                if config_data.get('deviceBranchContacts'):
+                    contacts = config_data['deviceBranchContacts']
+                    device_config_record.device_branch_contacts_phone_no = contacts.get('phoneNo')
+                    device_config_record.device_branch_contacts_email = contacts.get('email')
+                
+                device_config_record.updated_at = datetime.utcnow()
+            else:
+                # Create new record
+                device_config_record = DeviceConfiguration(
+                    device_id=str(device_id),
+                    tax_payer_name=config_data.get('taxPayerName'),
+                    tax_payer_tin=config_data.get('taxPayerTIN'),
+                    vat_number=config_data.get('vatNumber'),
+                    device_serial_no=config_data.get('deviceSerialNo'),
+                    device_branch_name=config_data.get('deviceBranchName'),
+                    device_operating_mode=config_data.get('deviceOperatingMode'),
+                    tax_payer_day_max_hrs=config_data.get('taxPayerDayMaxHrs'),
+                    qr_url=config_data.get('qrUrl'),
+                    operation_id=config_data.get('operationID')
+                )
+                
+                # Address information
+                if config_data.get('deviceBranchAddress'):
+                    address = config_data['deviceBranchAddress']
+                    device_config_record.device_branch_address_province = address.get('province')
+                    device_config_record.device_branch_address_city = address.get('city')
+                    device_config_record.device_branch_address_street = address.get('street')
+                    device_config_record.device_branch_address_house_no = address.get('houseNo')
+                
+                # Contact information
+                if config_data.get('deviceBranchContacts'):
+                    contacts = config_data['deviceBranchContacts']
+                    device_config_record.device_branch_contacts_phone_no = contacts.get('phoneNo')
+                    device_config_record.device_branch_contacts_email = contacts.get('email')
+            
+            # Save to database
+            db.session.add(device_config_record)
+            db.session.commit()
+            
+            current_app.logger.info(f"Device configuration saved/updated for device_id: {device_id}")
+            
+            return jsonify(config_data), 200
         else:
             return jsonify({"error": "Request failed"}), response.status_code
 
     except Exception as e:
         current_app.logger.error(f"Error in get_config: {e}")
         return jsonify({"error": str(e)}), 400
+
+
+@api.route('/device_config/<device_id>', methods=['GET'])
+def get_stored_device_config(device_id):
+    """Get stored device configuration from database"""
+    try:
+        device_config = DeviceConfiguration.query.filter_by(device_id=str(device_id)).first()
+        
+        if not device_config:
+            return jsonify({"error": "Device configuration not found"}), 404
+        
+        # Format the response to match the ZIMRA API response structure
+        config_data = {
+            "taxPayerName": device_config.tax_payer_name,
+            "taxPayerTIN": device_config.tax_payer_tin,
+            "vatNumber": device_config.vat_number,
+            "deviceSerialNo": device_config.device_serial_no,
+            "deviceBranchName": device_config.device_branch_name,
+            "deviceBranchAddress": {
+                "province": device_config.device_branch_address_province,
+                "city": device_config.device_branch_address_city,
+                "street": device_config.device_branch_address_street,
+                "houseNo": device_config.device_branch_address_house_no
+            },
+            "deviceBranchContacts": {
+                "phoneNo": device_config.device_branch_contacts_phone_no,
+                "email": device_config.device_branch_contacts_email
+            },
+            "deviceOperatingMode": device_config.device_operating_mode,
+            "taxPayerDayMaxHrs": device_config.tax_payer_day_max_hrs,
+            "qrUrl": device_config.qr_url,
+            "operationID": device_config.operation_id
+        }
+        
+        return jsonify(config_data), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error in get_stored_device_config: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @api.route('/invoices', methods=['GET'])

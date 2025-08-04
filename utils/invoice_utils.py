@@ -2,8 +2,50 @@ import json
 import hashlib
 import base64
 from datetime import datetime
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 from app.models import Invoice, InvoiceLineItem, DeviceBranchAddress, DeviceBranchContact, DeviceConfig, FiscalDay
 from app import db
+
+
+class ReceiptDeviceSignature:
+    """Class to handle receipt device signature generation like Django implementation"""
+    
+    def __init__(self, string_to_sign: str, private_key):
+        self.string_to_sign = string_to_sign
+        self.private_key = private_key
+        self._signature = None
+        self._hash = None
+    
+    def sign_data(self) -> str:
+        """Sign the data and return base64 encoded signature"""
+        if self._signature is None:
+            signature = self.private_key.sign(
+                self.string_to_sign.encode('utf-8'),
+                padding.PKCS1v15(),
+                hashes.SHA256()
+            )
+            self._signature = base64.b64encode(signature).decode('utf-8')
+        return self._signature
+    
+    def get_hash(self) -> str:
+        """Get the hash of the string that was signed"""
+        if self._hash is None:
+            hash_obj = hashes.Hash(hashes.SHA256())
+            hash_obj.update(self.string_to_sign.encode('utf-8'))
+            hash_value = hash_obj.finalize()
+            self._hash = base64.b64encode(hash_value).decode('utf-8')
+        return self._hash
+
+
+def read_pem_file(file_path: str):
+    """Read PEM file and return the key object"""
+    from cryptography.hazmat.primitives import serialization
+    with open(file_path, 'rb') as key_file:
+        return serialization.load_pem_private_key(
+            key_file.read(),
+            password=None
+        )
 
 
 def invoice_exists(device_id: str, invoice_id: str) -> bool:
@@ -21,7 +63,9 @@ def get_global_number(device_id: str) -> int:
     """Get the global number for a device"""
     # This is a simplified version - you might need to implement based on your business logic
     latest_invoice = Invoice.query.filter_by(device_id=device_id).order_by(Invoice.receipt_global_no.desc()).first()
-    return latest_invoice.receipt_global_no if latest_invoice else 0
+    if latest_invoice and latest_invoice.receipt_global_no is not None:
+        return latest_invoice.receipt_global_no
+    return 0
 
 
 def get_fiscal_day_open_date_time(open_day_date_time: str) -> str:
@@ -212,44 +256,49 @@ def update_fiscalized_invoice(update_data: dict) -> Invoice:
 def qr_string_generator(device_id: str, qr_url: str, receipt_date: str, 
                        reciept_global_no: int, reciept_signature: str) -> str:
     """
-    Generate QR code string in the correct ZIMRA format.
+    Generate QR code string according to ZIMRA specifications.
     
-    Expected format:
-    https://fdmstest.zimra.co.zw/Receipt/Result?DeviceId=0000026241&ReceiptDate=07%2F30%2F2025%2000%3A00%3A00&ReceiptGlobalNo=0000000013&ReceiptQrData=A4CA-3605-FF81-F1BA
+    QR String Components:
+    - Base URL: https://fdmstest.zimra.co.zw/
+    - Device ID: 10-digit zero-padded device identifier
+    - Receipt Date: Date in format DDMMYYYY (e.g., "02232024" for February 23, 2024)
+    - Global Receipt Number: 10-digit zero-padded sequential receipt number
+    - Signature Hash: MD5 hash of the digital signature (16 characters, uppercase)
+    
+    Format: BaseURL + DeviceID + ReceiptDate + GlobalReceiptNumber + SignatureHash
     """
-    import urllib.parse
+    # 1. Base URL (ensure it ends with /)
+    base_url = qr_url.rstrip('/') + '/'
     
-    # Pad device ID with zeros to 10 digits
-    padded_device_id = device_id.zfill(10)
+    # 2. Device ID: 10-digit zero-padded device identifier
+    padded_device_id = str(device_id).zfill(10)
     
-    # Pad receipt global number with zeros to 10 digits
+    # 3. Receipt Date: Format DDMMYYYY
+    try:
+        # Parse receipt_date (expected format: YYYY-MM-DD)
+        date_obj = datetime.strptime(receipt_date, '%Y-%m-%d')
+        formatted_date = date_obj.strftime('%d%m%Y')  # DDMMYYYY format
+    except ValueError:
+        # Fallback to current date if parsing fails
+        formatted_date = datetime.now().strftime('%d%m%Y')
+    
+    # 4. Global Receipt Number: 10-digit zero-padded sequential receipt number
     padded_receipt_global_no = str(reciept_global_no).zfill(10)
     
-    # Format receipt date as MM/DD/YYYY HH:MM:SS and URL encode it
-    # receipt_date should be in format like "2025-07-30"
+    # 5. Signature Hash: MD5 hash of the digital signature (16 characters, uppercase)
     try:
-        date_obj = datetime.strptime(receipt_date, '%Y-%m-%d')
-        formatted_date = date_obj.strftime('%m/%d/%Y 00:00:00')
-    except:
-        # Fallback to current date if parsing fails
-        formatted_date = datetime.now().strftime('%m/%d/%Y 00:00:00')
-    
-    # URL encode the date
-    encoded_date = urllib.parse.quote(formatted_date)
-    
-    # Convert signature to hex format (like Django implementation)
-    # The signature should be in base64 format, convert to hex
-    try:
+        # Decode base64 signature
         signature_bytes = base64.b64decode(reciept_signature)
-        hex_signature = signature_bytes.hex().upper()
-        # Format as 4-character groups separated by hyphens
-        formatted_signature = '-'.join([hex_signature[i:i+4] for i in range(0, len(hex_signature), 4)])
-    except:
+        # Generate MD5 hash
+        md5_hash = hashlib.md5(signature_bytes).hexdigest().upper()
+        # Ensure it's exactly 16 characters (MD5 is 32 hex chars, take first 16)
+        signature_hash = md5_hash[:16]
+    except Exception:
         # Fallback if signature conversion fails
-        formatted_signature = "0000-0000-0000-0000"
+        signature_hash = "0000000000000000"
     
-    # Build the QR URL with query parameters
-    qr_string = f"{qr_url}Receipt/Result?DeviceId={padded_device_id}&ReceiptDate={encoded_date}&ReceiptGlobalNo={padded_receipt_global_no}&ReceiptQrData={formatted_signature}"
+    # 6. Concatenate all components
+    qr_string = f"{base_url}{padded_device_id}{formatted_date}{padded_receipt_global_no}{signature_hash}"
     
     return qr_string
 
@@ -284,3 +333,30 @@ def receipt_date_print() -> str:
 def get_credit_debit_note_invoice(device_id: str, receipt_id: str) -> Invoice:
     """Get the invoice referenced in a credit/debit note"""
     return Invoice.query.filter_by(device_id=device_id, zimra_receipt_number=receipt_id).first() 
+
+
+def test_qr_string_generation():
+    """
+    Test function to demonstrate QR string generation with the new ZIMRA format.
+    This function shows how the QR string is constructed according to specifications.
+    """
+    # Example values
+    device_id = "26428"
+    qr_url = "https://fdmstest.zimra.co.zw"
+    receipt_date = "2024-02-23"  # YYYY-MM-DD format
+    receipt_global_no = 13
+    receipt_signature = "base64_encoded_signature_here"  # This would be the actual signature
+    
+    # Generate QR string
+    qr_string = qr_string_generator(device_id, qr_url, receipt_date, receipt_global_no, receipt_signature)
+    
+    # Print breakdown of components
+    print("QR String Components Breakdown:")
+    print(f"Base URL: {qr_url}/")
+    print(f"Device ID (10-digit): {str(device_id).zfill(10)}")
+    print(f"Receipt Date (DDMMYYYY): {datetime.strptime(receipt_date, '%Y-%m-%d').strftime('%d%m%Y')}")
+    print(f"Global Receipt Number (10-digit): {str(receipt_global_no).zfill(10)}")
+    print(f"Signature Hash (16 chars): {hashlib.md5(base64.b64decode(receipt_signature)).hexdigest().upper()[:16]}")
+    print(f"Final QR String: {qr_string}")
+    
+    return qr_string 

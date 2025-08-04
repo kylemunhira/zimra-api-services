@@ -21,6 +21,43 @@ class FiscalDay(db.Model):
     fiscal_day_no = db.Column(db.Integer, nullable=True)
 
 
+class DeviceConfiguration(db.Model):
+    __tablename__ = 'device_configuration'
+    id = db.Column(db.Integer, primary_key=True)
+    device_id = db.Column(db.String(50), db.ForeignKey('device_info.device_id'), nullable=False)
+    
+    # Tax Payer Information
+    tax_payer_name = db.Column(db.String(255))
+    tax_payer_tin = db.Column(db.String(50))
+    vat_number = db.Column(db.String(50))
+    
+    # Device Information
+    device_serial_no = db.Column(db.String(100))
+    device_branch_name = db.Column(db.String(255))
+    device_operating_mode = db.Column(db.String(50))
+    tax_payer_day_max_hrs = db.Column(db.Integer)
+    
+    # QR URL
+    qr_url = db.Column(db.String(255))
+    
+    # Operation ID
+    operation_id = db.Column(db.String(100))
+    
+    # Address Information (stored as JSON)
+    device_branch_address_province = db.Column(db.String(100))
+    device_branch_address_city = db.Column(db.String(100))
+    device_branch_address_street = db.Column(db.String(255))
+    device_branch_address_house_no = db.Column(db.String(50))
+    
+    # Contact Information
+    device_branch_contacts_phone_no = db.Column(db.String(50))
+    device_branch_contacts_email = db.Column(db.String(255))
+    
+    # Timestamps
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class DeviceConfig(db.Model):
     __tablename__ = 'device_config'
     id = db.Column(db.Integer, primary_key=True)
