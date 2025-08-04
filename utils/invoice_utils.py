@@ -2,7 +2,7 @@ import json
 import hashlib
 import base64
 from datetime import datetime
-from app.models import Invoice, InvoiceLineItem, DeviceBranchAddress, DeviceBranchContact, DeviceConfig
+from app.models import Invoice, InvoiceLineItem, DeviceBranchAddress, DeviceBranchContact, DeviceConfig, FiscalDay
 from app import db
 
 
@@ -24,29 +24,47 @@ def get_global_number(device_id: str) -> int:
     return latest_invoice.receipt_global_no if latest_invoice else 0
 
 
+def get_fiscal_day_open_date_time(open_day_date_time: str) -> str:
+    """Get fiscal day open date time in the required format"""
+    # Convert the fiscal day open date time to the format expected by counter functions
+    try:
+        date_obj = datetime.fromisoformat(open_day_date_time.replace('Z', '+00:00'))
+        return date_obj.strftime('%Y-%m-%d %H:%M:%S')
+    except:
+        return open_day_date_time
+
+
+def get_previous_hash(device_id: str, fiscal_open_date_time: str) -> str:
+    """Get the previous receipt hash for chaining"""
+    # Get the most recent invoice for this device and fiscal day
+    latest_invoice = Invoice.query.filter_by(device_id=device_id).order_by(Invoice.receipt_counter.desc()).first()
+    if latest_invoice and latest_invoice.hash_string:
+        return latest_invoice.hash_string
+    return ''
+
+
 def calculate_tax_summary(receipt_lines: list) -> dict:
-    """Calculate tax summary from receipt lines"""
-    tax_summary = {}
+    """Calculate tax summary from receipt lines with enhanced logic like Django"""
+    tax_summary = {
+        '15': {'taxCode': '15', 'taxPercent': 15.0, 'taxID': 1, 'taxAmount': 0, 'salesAmountWithTax': 0},
+        '0': {'taxCode': '0', 'taxPercent': 0.0, 'taxID': 2, 'taxAmount': 0, 'salesAmountWithTax': 0},
+        '-1': {'taxCode': None, 'taxPercent': 0.0, 'taxID': None, 'taxAmount': 0, 'salesAmountWithTax': 0},  # Exempt
+        '5': {'taxCode': '5', 'taxPercent': 5.0, 'taxID': 3, 'taxAmount': 0, 'salesAmountWithTax': 0}
+    }
     
     for line in receipt_lines:
-        tax_code = line.get('taxCode', 'A')
-        tax_percent = line.get('taxPercent', 0)
-        tax_id = line.get('taxID', 1)
-        
-        if tax_code not in tax_summary:
-            tax_summary[tax_code] = {
-                'taxCode': tax_code,
-                'taxPercent': tax_percent,
-                'taxID': tax_id,
-                'taxAmount': 0,
-                'salesAmountWithTax': 0
-            }
-        
+        tax_code = str(line.get('taxCode', '15'))
+        tax_percent = float(line.get('taxPercent', 15.0))
         line_total = float(line.get('receiptLineTotal', 0))
-        tax_amount = line_total * (tax_percent / 100)
         
-        tax_summary[tax_code]['taxAmount'] += tax_amount
-        tax_summary[tax_code]['salesAmountWithTax'] += line_total
+        # Map tax codes to the summary structure
+        if tax_code in tax_summary:
+            tax_summary[tax_code]['taxAmount'] += line_total * (tax_percent / 100)
+            tax_summary[tax_code]['salesAmountWithTax'] += line_total
+        else:
+            # Default to 15% if tax code not found
+            tax_summary['15']['taxAmount'] += line_total * 0.15
+            tax_summary['15']['salesAmountWithTax'] += line_total
     
     return tax_summary
 
@@ -65,9 +83,12 @@ def get_tax_percentage(tax_code: str) -> float:
         'A': 0.0,
         'B': 0.0,
         'C': 15.0,
-        'D': 0.0
+        'D': 0.0,
+        '15': 15.0,
+        '0': 0.0,
+        '5': 5.0
     }
-    return tax_percentages.get(tax_code.upper(), 0.0)
+    return tax_percentages.get(tax_code.upper(), 15.0)
 
 
 def get_tax_id(tax_code: str) -> int:
@@ -76,7 +97,10 @@ def get_tax_id(tax_code: str) -> int:
         'A': 1,
         'B': 2,
         'C': 3,
-        'D': 4
+        'D': 4,
+        '15': 1,
+        '0': 2,
+        '5': 3
     }
     return tax_ids.get(tax_code.upper(), 1)
 
@@ -95,9 +119,9 @@ def create_invoice_line_items(invoice_id: int, receipt_lines: list) -> list:
             receipt_line_price=float(line.get('receiptLinePrice', 0)),
             receipt_line_quantity=float(line.get('receiptLineQuantity', 0)),
             receipt_line_total=float(line.get('receiptLineTotal', 0)),
-            tax_code=line.get('taxCode', 'A'),
-            tax_percent=get_tax_percentage(line.get('taxCode', 'A')),
-            tax_id=get_tax_id(line.get('taxCode', 'A'))
+            tax_code=line.get('taxCode', '15'),
+            tax_percent=get_tax_percentage(line.get('taxCode', '15')),
+            tax_id=get_tax_id(line.get('taxCode', '15'))
         )
         line_items.append(line_item)
         db.session.add(line_item)
@@ -254,4 +278,9 @@ def qr_date() -> str:
 
 def receipt_date_print() -> str:
     """Get formatted receipt date for printing"""
-    return datetime.now().strftime('%d/%m/%Y %H:%M:%S') 
+    return datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+
+
+def get_credit_debit_note_invoice(device_id: str, receipt_id: str) -> Invoice:
+    """Get the invoice referenced in a credit/debit note"""
+    return Invoice.query.filter_by(device_id=device_id, zimra_receipt_number=receipt_id).first() 

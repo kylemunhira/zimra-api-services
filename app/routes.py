@@ -9,7 +9,8 @@ from utils.invoice_utils import (
     invoice_exists, get_fiscal_day_counter, get_global_number, calculate_tax_summary,
     calculate_total_sales_amount_with_tax, create_invoice_line_items, create_invoice,
     update_fiscalized_invoice, qr_string_generator, base64_to_hex_md5, get_device_config,
-    qr_date, receipt_date_print
+    qr_date, receipt_date_print, get_fiscal_day_open_date_time, get_previous_hash,
+    get_credit_debit_note_invoice
 )
 from datetime import datetime
 from enum import Enum
@@ -414,54 +415,87 @@ def submit_receipt(device_id):
         if not open_fiscal_day:
             return jsonify({"error": "No open fiscal day found for this device"}), 404
 
-        # 4. Calculate receipt amounts from receiptLines and receiptTaxes
-        receipt_total = float(receipt_data["receiptTotal"])
-        receipt_tax_amount = 0.0
+        # 4. Check for duplicate invoice
+        if invoice_exists(device_id=str(device_id), invoice_id=str(receipt_data["invoiceNo"])):
+            return jsonify({"error": "Duplication Of Invoice Number"}), 400
+
+        # 5. Calculate counters and get previous hash
+        formatted_datetime = get_submit_receipt_date()
+        previous_receipt_hash = ''
+
+        counter = get_fiscal_day_counter(
+            device_id=str(device_id),
+            fiscal_open_date_time=get_fiscal_day_open_date_time(
+                open_day_date_time=open_fiscal_day.fiscal_day_open
+            )
+        )
+
+        if counter > 0:
+            previous_receipt_hash = get_previous_hash(
+                device_id=str(device_id),
+                fiscal_open_date_time=get_fiscal_day_open_date_time(
+                    open_day_date_time=open_fiscal_day.fiscal_day_open
+                )
+            )
+
+        # 6. Update receipt data with calculated values
+        updated_data = receipt_data.copy()
+        updated_data['receiptDate'] = formatted_datetime
+        updated_data['receiptCounter'] = counter + 1
+
+        global_number = get_global_number(str(device_id))
+        if global_number != -1:
+            updated_data['receiptGlobalNo'] = global_number + 1
+        else:
+            return jsonify({"error": "Global Value cannot be negative"}), 400
+
+        # 7. Calculate tax summary with enhanced logic
+        tax_summary = calculate_tax_summary(updated_data.get('receiptLines', []))
         
-        # Calculate tax amount from receiptTaxes if available
-        if "receiptTaxes" in receipt_data:
-            for tax in receipt_data["receiptTaxes"]:
-                receipt_tax_amount += float(tax.get("taxAmount", 0))
+        # Filter out exempt items (taxCode -1) and create modified exempt dict
+        modified_exempt_dict = {key: value for key, value in tax_summary['-1'].items() if key != 'taxPercent'}
         
-        # Calculate net amount (total - tax)
-        receipt_amount = receipt_total - receipt_tax_amount
-        
-        # 5. Generate ReceiptDeviceSignature
-        receipt_number = str(receipt_data["invoiceNo"])
-        receipt_date_time = receipt_data["receiptDate"]
-        
-        # Generate the string to sign for receipt
+        # Create list of tax objects in specific order like Django
+        my_object_list = [tax_summary['15'], tax_summary['0'], modified_exempt_dict, tax_summary['5']]
+        filtered_taxes = [item for item in my_object_list if item['taxCode'] is not None and item['taxID'] is not None]
+
+        # Calculate total
+        receipt_total = calculate_total_sales_amount_with_tax(filtered_taxes)
+        updated_data['receiptPayments'][0]['paymentAmount'] = receipt_total
+        updated_data['receiptTotal'] = receipt_total
+        updated_data['receiptTaxes'] = filtered_taxes
+
+        # 8. Generate string to sign with previous hash if available
         string_to_sign = generate_receipt_string(
             device_id=str(device_id),
-            receipt_number=receipt_number,
-            receipt_date_time=receipt_date_time,
-            receipt_amount=str(receipt_amount),
-            receipt_tax_amount=str(receipt_tax_amount),
+            receipt_number=str(updated_data['invoiceNo']),
+            receipt_date_time=updated_data['receiptDate'],
+            receipt_amount=str(receipt_total),
+            receipt_tax_amount="0",  # Will be calculated from taxes
             receipt_total_amount=str(receipt_total)
         )
-        
+
+        if previous_receipt_hash != '':
+            string_to_sign = string_to_sign + str(previous_receipt_hash)
+
         current_app.logger.debug(f"String to sign for SubmitReceipt: {string_to_sign}")
 
-        # Generate the signature using the device's private key
+        # 9. Generate signature
         with open(key_path, 'rb') as key_file:
             private_key = serialization.load_pem_private_key(
                 key_file.read(),
                 password=None
             )
         
-        # Sign the string
         signature = private_key.sign(
             string_to_sign.encode('utf-8'),
             padding.PKCS1v15(),
             hashes.SHA256()
         )
         
-        # Encode signature to base64
         receipt_device_signature = base64.b64encode(signature).decode('utf-8')
         
-        # 6. Add the signature to the receipt data (following Django pattern)
-        # Create the signature object structure like in Django
-        # Generate hash from the string that was signed
+        # 10. Create signature object
         hash_obj = hashes.Hash(hashes.SHA256())
         hash_obj.update(string_to_sign.encode('utf-8'))
         hash_value = hash_obj.finalize()
@@ -471,20 +505,18 @@ def submit_receipt(device_id):
             "signature": receipt_device_signature
         }
         
-        # Add signature to receipt data
-        receipt_data_with_signature = receipt_data.copy()
-        receipt_data_with_signature['receiptDeviceSignature'] = receipt_device_signature_obj
+        # 11. Add signature to receipt data
+        updated_data['receiptDeviceSignature'] = receipt_device_signature_obj
         
-        # Create the full payload structure like in Django
+        # 12. Prepare full payload
         full_payload = {
-            "receipt": receipt_data_with_signature
+            "receipt": updated_data
         }
         
-        # 7. Prepare secure session with ZIMRA
+        # 13. Prepare secure session with ZIMRA
         session = requests.Session()
         session.cert = (cert_path, key_path)
 
-        # 8. Prepare headers
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -492,55 +524,32 @@ def submit_receipt(device_id):
             "DeviceModelVersion": device.model_version
         }
 
-        # 9. Send request to ZIMRA (following Django pattern)
+        # 14. Send request to ZIMRA
         url = f'https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/SubmitReceipt'
-        
-        # Use the same payload structure as the working Django code
         json_data = json.dumps(full_payload)
-        current_app.logger.debug(f"SubmitReceipt Payload (Django pattern): {json_data}")
+        current_app.logger.debug(f"SubmitReceipt Payload: {json_data}")
         
-        # Send the request
         response = session.post(url, data=json_data, headers=headers, verify=False)
         current_app.logger.debug(f"ZIMRA SubmitReceipt status: {response.status_code}")
         
-        # 10. Process successful response and update database
+        # 15. Process successful response
         if response.status_code == 200:
             zimra_response = response.json()
-            current_app.logger.debug(f"#################################################")
-            current_app.logger.debug(f"ZIMRA Response status Ok: {zimra_response}")
-            current_app.logger.debug(f"#################################################")
+            current_app.logger.debug(f"ZIMRA Response: {zimra_response}")
             
             try:
-                # Check for duplicate invoice
-                if invoice_exists(device_id=str(device_id), invoice_id=str(receipt_data["invoiceNo"])):
-                    return jsonify({"error": "Duplication Of Invoice Number"}), 400
-                
                 # Get device configuration
                 config_data = get_device_config(str(device_id))
                 
-                # Calculate counters
-                counter = get_fiscal_day_counter(device_id=str(device_id), fiscal_open_date_time=open_fiscal_day.fiscal_day_open)
-                global_number = get_global_number(str(device_id))
-                
-                if global_number == -1:
-                    return jsonify({"error": "Global Value cannot be negative"}), 400
-                
-                # Calculate tax summary
-                tax_summary = calculate_tax_summary(receipt_data.get('receiptLines', []))
-                filtered_taxes = [tax for tax in tax_summary.values() if tax['taxCode'] is not None and tax['taxID'] is not None]
-                
-                # Calculate total
-                receipt_total = calculate_total_sales_amount_with_tax(filtered_taxes)
-                
                 # Create invoice data
                 invoice_data = {
-                    'invoice_id': receipt_data["invoiceNo"],
+                    'invoice_id': updated_data['invoiceNo'],
                     'device_id': str(device_id),
-                    'receipt_currency': receipt_data.get('receiptCurrency', 'USD'),
-                    'money_type': 'Cash',  # Default to Cash
-                    'receipt_type': receipt_data["receiptType"],
+                    'receipt_currency': updated_data.get('receiptCurrency', 'USD'),
+                    'money_type': 'Cash',
+                    'receipt_type': updated_data['receiptType'],
                     'receipt_total': receipt_total,
-                    'line_items': receipt_data.get('receiptLines', [])
+                    'line_items': updated_data.get('receiptLines', [])
                 }
                 
                 # Create invoice in database
@@ -549,19 +558,34 @@ def submit_receipt(device_id):
                 # Generate QR code
                 qr_string = qr_string_generator(
                     device_id=str(device_id),
-                    qr_url="https://fdmstest.zimra.co.zw/",  
+                    qr_url="https://fdmstest.zimra.co.zw/",
                     receipt_date=qr_date(),
                     reciept_global_no=global_number + 1,
-                    reciept_signature=receipt_device_signature  # Use the signature directly, not the hash
+                    reciept_signature=receipt_device_signature
                 )
                 
-                # Generate verification code (convert signature to hex MD5)
+                # Generate verification code
                 verification_string = base64_to_hex_md5(receipt_device_signature)
-             
+                
+                # Handle credit/debit note logic
+                debit_credit_note_invoice_ref = None
+                debit_credit_note_invoice_ref_date = None
+                
+                if updated_data.get('creditDebitNote') is not None:
+                    debited_credited_invoice = get_credit_debit_note_invoice(
+                        device_id=str(device_id),
+                        receipt_id=str(updated_data['creditDebitNote']['receiptID'])
+                    )
+                    
+                    if debited_credited_invoice:
+                        debit_credit_note_invoice_ref = debited_credited_invoice.invoice_id
+                        debit_credit_note_invoice_ref_date = debited_credited_invoice.timestamp
+                    else:
+                        debit_credit_note_invoice_ref = str(updated_data['creditDebitNote']['receiptID'])
                 
                 # Prepare update data
                 update_data = {
-                    'invoice_id': receipt_data["invoiceNo"],
+                    'invoice_id': updated_data['invoiceNo'],
                     'zimra_receipt_number': str(zimra_response.get('receiptID', '')),
                     'operation_id': str(zimra_response.get('operationID', '')),
                     'qr_code_string': qr_string,
@@ -571,13 +595,15 @@ def submit_receipt(device_id):
                     'receipt_counter': counter + 1,
                     'receipt_global_no': global_number + 1,
                     'fiscal_day_number': str(open_fiscal_day.fiscal_day_no),
-                    'receipt_notes': receipt_data.get('receiptNotes', ''),
+                    'receipt_notes': updated_data.get('receiptNotes', ''),
                     'tax_payer_name': config_data.get('taxPayerName', ''),
                     'tax_payer_tin': str(config_data.get('taxPayerTIN', '')),
                     'vat_number': str(config_data.get('vatNumber', '')),
                     'device_branch_name': str(config_data.get('deviceBranchName', '')),
                     'device_branch_address': config_data.get('deviceBranchAddress', {}),
-                    'device_branch_contact': config_data.get('deviceBranchContacts', {})
+                    'device_branch_contact': config_data.get('deviceBranchContacts', {}),
+                    'debit_credit_note_invoice_ref': debit_credit_note_invoice_ref,
+                    'debit_credit_note_invoice_ref_date': debit_credit_note_invoice_ref_date
                 }
                 
                 # Update invoice with fiscalization data
@@ -598,7 +624,7 @@ def submit_receipt(device_id):
                     "receiptGlobalNo": global_number + 1,
                     "fiscalDayNumber": str(open_fiscal_day.fiscal_day_no),
                     "receiptID": zimra_response.get('receiptID', ''),
-                    "invoiceNumber": receipt_data["invoiceNo"],
+                    "invoiceNumber": updated_data['invoiceNo'],
                     "deviceID": str(device_id),
                     "date": receipt_date_print(),
                     "taxPercentage": "15",
@@ -614,31 +640,11 @@ def submit_receipt(device_id):
         else:
             try:
                 error_data = response.json()
-                current_app.logger.debug(f"#################################################")
                 current_app.logger.debug(f"ZIMRA Error Response: {error_data}")
-                current_app.logger.debug(f"#################################################")
                 return jsonify({"error": "ZIMRA request failed", "status_code": response.status_code, "details": error_data}), response.status_code
             except:
-                current_app.logger.debug(f"#################################################")
                 current_app.logger.debug(f"ZIMRA Error Response (raw): {response.content}")
-                current_app.logger.debug(f"#################################################")
                 return jsonify({"error": "ZIMRA request failed", "status_code": response.status_code}), response.status_code
-        
-        for i, payload in enumerate(payload_variations):
-            json_data = json.dumps(payload)
-            current_app.logger.debug(f"Trying payload variation {i+1}: {json_data}")
-            
-            response = session.post(url, data=json_data, headers=headers, verify=False)
-            current_app.logger.debug(f"ZIMRA SubmitReceipt status (variation {i+1}): {response.status_code}")
-            
-            if response.status_code == 200:
-                data = response.json()
-                current_app.logger.debug(f"#################################################")
-                current_app.logger.debug(f"ZIMRA Response status Ok: {data}")
-                current_app.logger.debug(f"#################################################")
-                return jsonify(data), 200
-
-
 
     except Exception as e:
         error_details = {
