@@ -1,4 +1,4 @@
-from flask import Blueprint, jsonify, request, current_app, send_from_directory, render_template_string
+from flask import Blueprint, jsonify, request, current_app, send_from_directory, render_template_string, send_file
 from app.models import DeviceInfo, FiscalDay, Invoice, InvoiceLineItem, DeviceBranchAddress, DeviceBranchContact, DeviceConfiguration
 from app import db
 from utils.close_day_string_utilts import generate_close_day_string, add_zeros
@@ -8,9 +8,10 @@ from utils.update_closeday import update_fiscal_counter_data
 from utils.invoice_utils import (
     invoice_exists, get_fiscal_day_counter, get_global_number, calculate_tax_summary,
     calculate_total_sales_amount_with_tax, create_invoice_line_items, create_invoice,
-    update_fiscalized_invoice, qr_string_generator, base64_to_hex_md5, get_device_config,
+    update_fiscalized_invoice, qr_string_generator, base64_to_hex_md5,
     qr_date, receipt_date_print, get_fiscal_day_open_date_time, get_previous_hash,
-    get_credit_debit_note_invoice, ReceiptDeviceSignature, read_pem_file
+    get_credit_debit_note_invoice, ReceiptDeviceSignature, read_pem_file,
+    generate_close_day_payload
 )
 from datetime import datetime
 from enum import Enum
@@ -26,6 +27,13 @@ import logging
 import json
 import urllib3
 import hashlib
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from io import BytesIO
+from datetime import datetime
 
 
 # Disable SSL warnings for testing
@@ -49,7 +57,11 @@ def get_fiscal_number(device_id: str) -> int:
     device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
     current_app.logger.debug(f"mydeviceId: {device}")
 
-    fiscal_day = FiscalDay.query.filter_by(device_id= device.id, is_open=True).first()
+    # Get the most recent open fiscal day (highest fiscal_day_no)
+    fiscal_day = FiscalDay.query.filter_by(
+        device_id=device.device_id, 
+        is_open=True
+    ).order_by(FiscalDay.fiscal_day_no.desc()).first()
     current_app.logger.debug(f"fiscalDay: no {fiscal_day.fiscal_day_no}")
     if not fiscal_day:
         raise ValueError(f"No open fiscal day found for device_id: {device_id}")
@@ -191,12 +203,12 @@ def get_status(device_id):
 @api.route('/openday/<device_id>', methods=['POST'])
 def open_day(device_id):
     # Load device config from DB or return 404 if not found
-    #device_config = DeviceInfo.query.filter_by(device_id=device_id).first()
     device_config = get_device_config(device_id)
-    cert_path = device_config["certificate"]
-    key_path = device_config["key"]
     if not device_config:
         return jsonify({"error": "Device not found"}), 404
+    
+    cert_path = device_config["certificate"]
+    key_path = device_config["key"]
 
     device = DeviceInfo.query.filter_by(device_id=device_id).first()
 
@@ -273,40 +285,10 @@ def close_day(device_id):
     """
     Close a fiscal day for a specific device according to ZIMRA API specification.
     
-    Expected payload structure:
-    {
-        "fiscalDayNo": "123",
-        "fiscalDayCounters": [
-            {
-                "fiscalCounterType": "TaxByTax",
-                "fiscalCounterTaxPercent": 15.0,
-                "fiscalCounterTaxID": 1,
-                "fiscalCounterCurrency": "USD",
-                "fiscalCounterValue": 100.00,
-                "fiscalCounterMoneyType": "CASH"
-            }
-        ]
-    }
+    This endpoint uses the Django-style approach with generate_counters function.
     """
     try:
-        # 1. Read and validate posted JSON
-        posted_data = request.get_json()
-        current_app.logger.debug(f"Received CloseDay payload: {posted_data}")
-        
-        # Validate required fields according to ZIMRA API specification
-        if not posted_data:
-            return jsonify({"error": "No payload provided"}), 400
-            
-        if "fiscalDayNo" not in posted_data:
-            return jsonify({"error": "Missing required field: fiscalDayNo"}), 400
-            
-        if "fiscalDayCounters" not in posted_data:
-            return jsonify({"error": "Missing required field: fiscalDayCounters"}), 400
-            
-        if not isinstance(posted_data["fiscalDayCounters"], list):
-            return jsonify({"error": "fiscalDayCounters must be an array"}), 400
-
-        # 2. Load device config
+        # 1. Load device config
         device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
         if not device:
             return jsonify({"error": "Device not found"}), 404
@@ -314,43 +296,66 @@ def close_day(device_id):
         cert_path = device.certificate_path
         key_path = device.key_path
 
-        # 3. Get the open fiscal day
-        open_fiscal_day = FiscalDay.query.filter_by(device_id=device.device_id, is_open=True).first()
+        # 2. Get fiscal day number and close date
+        fiscal_day_number = str(get_fiscal_number(device_id))
+        
+        # 3. Get the open fiscal day that matches the fiscal day number
+        open_fiscal_day = FiscalDay.query.filter_by(
+            device_id=device.device_id, 
+            fiscal_day_no=int(fiscal_day_number),
+            is_open=True
+        ).first()
         if not open_fiscal_day:
-            return jsonify({"error": "No open fiscal day found for this device"}), 404
+            return jsonify({"error": f"No open fiscal day {fiscal_day_number} found for this device"}), 404
 
-        # 4. Validate fiscal day number matches
-        expected_fiscal_day_no = str(open_fiscal_day.fiscal_day_no)
-        provided_fiscal_day_no = str(posted_data["fiscalDayNo"])
+        # Use the fiscal day open date for closing (this is the correct approach)
+        fiscal_close_date = open_fiscal_day.fiscal_day_open
         
-        if expected_fiscal_day_no != provided_fiscal_day_no:
-            return jsonify({
-                "error": "Fiscal day number mismatch", 
-                "expected": expected_fiscal_day_no,
-                "provided": provided_fiscal_day_no
-            }), 400
+        # Format the close date properly for signature generation
+        from utils.close_day_string_utilts import get_close_day_date_format
+        formatted_close_date = get_close_day_date_format(fiscal_close_date)
+        
+        # 4. Generate counters using Django-style approach
+        try:
+            # Read private key for generate_counters
+            with open(key_path, 'rb') as key_file:
+                private_key_data = key_file.read()
+            
+            # Generate the close day data using generate_counters
+            close_data = generate_counters(
+                private_key=private_key_data,
+                device_id=str(device_id),
+                date_string=open_fiscal_day.fiscal_day_open,
+                close_day_date=fiscal_close_date,
+                fiscal_day_no=int(fiscal_day_number)  # Use the fiscal day number from get_fiscal_number
+            )
+            
+            current_app.logger.debug(f"Generated CloseDay data: {close_data}")
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
 
-        # 5. Generate FiscalDayDeviceSignature
-        fiscal_close_date = get_close_day_string_date()
-        
-        # Generate the string to sign
+        # 5. Update fiscal counter data (Django-style)
+        updated_counters = update_fiscal_counter_data(close_data['fiscalDayCounters'])
+        close_data['fiscalDayCounters'] = updated_counters
+
+        # 6. Generate string to sign using the correct format
         string_to_sign = generate_close_day_string(
             device_id=str(device_id),
-            fiscal_day_no=expected_fiscal_day_no,
-            date=fiscal_close_date,
-            receipt_close=posted_data
+            fiscal_day_no=fiscal_day_number,
+            date=formatted_close_date,
+            receipt_close=close_data
         )
         
         current_app.logger.debug(f"String to sign for CloseDay: {string_to_sign}")
 
-        # Generate the signature using the device's private key
+        # 7. Generate the signature using the device's private key
         with open(key_path, 'rb') as key_file:
             private_key = serialization.load_pem_private_key(
                 key_file.read(),
                 password=None
             )
         
-        # Sign the string
+        # Sign the string using SHA256 with PKCS1v15 padding
         signature = private_key.sign(
             string_to_sign.encode('utf-8'),
             padding.PKCS1v15(),
@@ -360,15 +365,23 @@ def close_day(device_id):
         # Encode signature to base64
         fiscal_day_device_signature = base64.b64encode(signature).decode('utf-8')
         
-        # 6. Add the signature to the payload
-        close_data = posted_data.copy()
-        close_data['fiscalDayDeviceSignature'] = fiscal_day_device_signature
+        # 8. Add the signature to the payload
+        # Generate MD5 hash of the signature (16 characters, uppercase)
+        signature_bytes = base64.b64decode(fiscal_day_device_signature)
+        md5_hash = hashlib.md5(signature_bytes).hexdigest().upper()
+        signature_hash = md5_hash[:16]  # Take first 16 characters
         
-        # 7. Prepare secure session with ZIMRA
+        # Ensure the signature format matches ZIMRA expectations
+        close_data['fiscalDayDeviceSignature'] = {
+            "hash": signature_hash,
+            "signature": fiscal_day_device_signature
+        }
+        
+        # 9. Prepare secure session with ZIMRA
         session = requests.Session()
         session.cert = (cert_path, key_path)
 
-        # 8. Prepare headers according to ZIMRA API specification
+        # 10. Prepare headers according to ZIMRA API specification
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -376,7 +389,7 @@ def close_day(device_id):
             "DeviceModelVersion": device.model_version
         }
 
-        # 9. Send request to ZIMRA
+        # 11. Send request to ZIMRA
         json_data = json.dumps(close_data)
         current_app.logger.debug(f"CloseDay Payload with signature: {json_data}")
 
@@ -385,7 +398,7 @@ def close_day(device_id):
 
         current_app.logger.debug(f"ZIMRA CloseDay status: {response.status_code}")
 
-        # 10. Process response and update local DB if successful
+        # 12. Process response and update local DB if successful
         if response.status_code == 200:
             data = response.json()
             current_app.logger.debug(f"ZIMRA CloseDay response: {data}")
@@ -441,6 +454,13 @@ def submit_receipt(device_id):
         for field in required_fields:
             if field not in receipt_data:
                 return jsonify({"error": f"Missing required field: {field}"}), 400
+        
+        # Validate credit/debit note specific fields
+        if receipt_data.get('creditDebitNote') is not None:
+            if 'receiptID' not in receipt_data['creditDebitNote']:
+                return jsonify({"error": "Credit/Debit note must include receiptID in creditDebitNote"}), 400
+            if not receipt_data.get('receiptNotes'):
+                return jsonify({"error": "Credit/Debit note must include receiptNotes"}), 400
 
         # 2. Load device config
         device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
@@ -450,10 +470,10 @@ def submit_receipt(device_id):
         cert_path = device.certificate_path
         key_path = device.key_path
 
-        # 3. Get the open fiscal day
-        open_fiscal_day = FiscalDay.query.filter_by(device_id=device.device_id, is_open=True).first()
-        if not open_fiscal_day:
-            return jsonify({"error": "No open fiscal day found for this device"}), 404
+        # 3. Get the last fiscal day (open or closed)
+        last_fiscal_day = FiscalDay.query.filter_by(device_id=device.device_id).order_by(FiscalDay.id.desc()).first()
+        if not last_fiscal_day:
+            return jsonify({"error": "No fiscal day found for this device"}), 404
 
         # 4. Check for duplicate invoice
         if invoice_exists(device_id=str(device_id), invoice_id=str(receipt_data["invoiceNo"])):
@@ -466,7 +486,7 @@ def submit_receipt(device_id):
         counter = get_fiscal_day_counter(
             device_id=str(device_id),
             fiscal_open_date_time=get_fiscal_day_open_date_time(
-                open_day_date_time=open_fiscal_day.fiscal_day_open
+                open_day_date_time=last_fiscal_day.fiscal_day_open
             )
         )
 
@@ -474,37 +494,133 @@ def submit_receipt(device_id):
             previous_receipt_hash = get_previous_hash(
                 device_id=str(device_id),
                 fiscal_open_date_time=get_fiscal_day_open_date_time(
-                    open_day_date_time=open_fiscal_day.fiscal_day_open
+                    open_day_date_time=last_fiscal_day.fiscal_day_open
                 )
             )
 
         # 6. Update receipt data with calculated values
         updated_data = receipt_data.copy()
         updated_data['receiptDate'] = formatted_datetime
-        updated_data['receiptCounter'] = counter + 1
-
-        global_number = get_global_number(str(device_id))
-        if global_number is None:
-            # If no previous invoices exist, start with 0
-            global_number = 0
-        elif global_number < 0:
-            return jsonify({"error": "Global Value cannot be negative"}), 400
         
-        updated_data['receiptGlobalNo'] = global_number + 1
+       
+  
+        
+        # Set receiptCounter to the number of line items in the current invoice
+        receipt_lines = updated_data.get('receiptLines', [])
+        updated_data['receiptCounter'] = len(receipt_lines)
+        
+        # Check if this is a credit/debit note and handle receipt lines
+        is_credit_debit_note = updated_data.get('creditDebitNote') is not None
+        is_credit_note = False
+        is_debit_note = False
+        
+        if is_credit_debit_note:
+            # Determine if it's a credit note or debit note based on receiptType
+            receipt_type = updated_data.get('receiptType', '').lower()
+            if 'credit' in receipt_type:
+                is_credit_note = True
+            elif 'debit' in receipt_type:
+                is_debit_note = True
+            else:
+                # Default to credit note if receiptType is not specified
+                is_credit_note = True
+        
+        if is_credit_note:
+            # For credit notes, make all monetary values in receipt lines negative
+            for line in receipt_lines:
+                if 'receiptLinePrice' in line:
+                    line['receiptLinePrice'] = -abs(line['receiptLinePrice'])
+                if 'receiptLineTotal' in line:
+                    line['receiptLineTotal'] = -abs(line['receiptLineTotal'])
+        elif is_debit_note:
+            # For debit notes, ensure all monetary values in receipt lines are positive
+            for line in receipt_lines:
+                if 'receiptLinePrice' in line:
+                    line['receiptLinePrice'] = abs(line['receiptLinePrice'])
+                if 'receiptLineTotal' in line:
+                    line['receiptLineTotal'] = abs(line['receiptLineTotal'])
+
+        # Auto-generate global number
+        from utils.invoice_utils import increment_global_number
+        global_number = increment_global_number(str(device_id))
+        if global_number < 0:
+            return jsonify({"error": "Global Value cannot be negative"}), 400
+        current_app.logger.debug(f"Auto-generated global number: {global_number}")
+        
+        updated_data['receiptGlobalNo'] = global_number
 
         # 7. Calculate tax summary with enhanced logic
         tax_summary = calculate_tax_summary(updated_data.get('receiptLines', []))
         
-        # Filter out exempt items (taxCode -1) and create modified exempt dict
-        modified_exempt_dict = {key: value for key, value in tax_summary['-1'].items() if key != 'taxPercent'}
+        # Create tax objects based on actual tax codes used in receipt lines
+        filtered_taxes = []
         
-        # Create list of tax objects in specific order like Django
-        my_object_list = [tax_summary['15'], tax_summary['0'], modified_exempt_dict, tax_summary['5']]
-        filtered_taxes = [item for item in my_object_list if item['taxCode'] is not None and item['taxID'] is not None]
+        # Map tax codes to their proper structure
+        tax_mapping = {
+            '15': {'taxCode': '15', 'taxPercent': 15.0, 'taxID': 3},
+            '0': {'taxCode': '0', 'taxPercent': 0.0, 'taxID': 2},
+            '-1': {'taxCode': None, 'taxID': 1},  # Exempt - no taxPercent
+            '5': {'taxCode': '5', 'taxPercent': 5.0, 'taxID': 514}
+        }
+        
+        # Check if this is a credit/debit note
+        is_credit_debit_note = updated_data.get('creditDebitNote') is not None
+        is_credit_note = False
+        is_debit_note = False
+        
+        if is_credit_debit_note:
+            # Determine if it's a credit note or debit note based on receiptType
+            receipt_type = updated_data.get('receiptType', '').lower()
+            if 'credit' in receipt_type:
+                is_credit_note = True
+            elif 'debit' in receipt_type:
+                is_debit_note = True
+            else:
+                # Default to credit note if receiptType is not specified
+                is_credit_note = True
+        
+        # Add tax objects for each tax code that has sales
+        for tax_code, tax_data in tax_summary.items():
+            if abs(tax_data['salesAmountWithTax']) > 0:  # Include taxes with non-zero sales (positive or negative)
+                tax_object = {
+                    'taxCode': tax_data['taxCode'],
+                    'taxID': tax_data['taxID'],
+                    'taxAmount': tax_data['taxAmount'],
+                    'salesAmountWithTax': tax_data['salesAmountWithTax']
+                }
+                
+                # For credit notes, make all monetary values negative
+                if is_credit_note:
+                    tax_object['taxAmount'] = -abs(tax_data['taxAmount'])
+                    tax_object['salesAmountWithTax'] = -abs(tax_data['salesAmountWithTax'])
+                # For debit notes, ensure all monetary values are positive
+                elif is_debit_note:
+                    tax_object['taxAmount'] = abs(tax_data['taxAmount'])
+                    tax_object['salesAmountWithTax'] = abs(tax_data['salesAmountWithTax'])
+                
+                # Add taxPercent only for non-exempt items (exempt items have taxID 1)
+                if tax_data['taxID'] != 1:
+                    tax_object['taxPercent'] = tax_data['taxPercent']
+                
+                filtered_taxes.append(tax_object)
 
         # Calculate total
         receipt_total = calculate_total_sales_amount_with_tax(filtered_taxes)
-        updated_data['receiptPayments'][0]['paymentAmount'] = receipt_total
+        
+        # For credit notes, ensure total is negative
+        if is_credit_note:
+            receipt_total = -abs(receipt_total)
+        # For debit notes, ensure total is positive
+        elif is_debit_note:
+            receipt_total = abs(receipt_total)
+        
+        # Ensure receiptPayments has the proper structure
+        if 'receiptPayments' not in updated_data or not updated_data['receiptPayments']:
+            updated_data['receiptPayments'] = [{'moneyTypeCode': 'Cash', 'paymentAmount': receipt_total}]
+        else:
+            # Update the first payment method with the calculated total
+            updated_data['receiptPayments'][0]['paymentAmount'] = receipt_total
+        
         updated_data['receiptTotal'] = receipt_total
         updated_data['receiptTaxes'] = filtered_taxes
 
@@ -513,11 +629,7 @@ def submit_receipt(device_id):
 
         if previous_receipt_hash != '':
             string_to_sign = string_to_sign + str(previous_receipt_hash)
-        current_app.logger.debug(f"#################################################123")
-        current_app.logger.debug(f"Previous receipt hash: {previous_receipt_hash}")
-        current_app.logger.debug(f"#################################################123")
-        current_app.logger.debug(f"String to sign for SubmitReceipt: {string_to_sign}")
-        current_app.logger.debug(f"#################################################123")
+
 
         # 9. Generate signature using ReceiptDeviceSignature class
         private_key = read_pem_file(key_path)
@@ -546,14 +658,24 @@ def submit_receipt(device_id):
             "DeviceModelName": device.model_name,
             "DeviceModelVersion": device.model_version
         }
-        return jsonify(full_payload), 200
+
         # 14. Send request to ZIMRA
         url = f'https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/SubmitReceipt'
+        
+        # Debug: Log the calculated values before sending
+        current_app.logger.debug(f"Calculated receiptTotal: {updated_data.get('receiptTotal')}")
+        current_app.logger.debug(f"Calculated receiptTaxes: {updated_data.get('receiptTaxes')}")
+        current_app.logger.debug(f"Calculated receiptPayments: {updated_data.get('receiptPayments')}")
+        if is_credit_note:
+            current_app.logger.debug(f"Processing as Credit Note - all monetary values are negative")
+        elif is_debit_note:
+            current_app.logger.debug(f"Processing as Debit Note - all monetary values are positive")
+        
         json_data = json.dumps(full_payload)
         current_app.logger.debug(f"SubmitReceipt Payload: {json_data}")
- 
+        #return jsonify(json_data), 200
         response = session.post(url, data=json_data, headers=headers, verify=False)
-        #current_app.logger.debug(f"ZIMRA SubmitReceipt status: {response.content}")
+        #current_app.logger.debug(f"ZIMRA SubmitReceipt status: {json_data}")
         
         # 15. Process successful response
         if response.status_code == 200:
@@ -585,7 +707,7 @@ def submit_receipt(device_id):
                     device_id=str(device_id),
                     qr_url=qr_url,
                     receipt_date=qr_date(),
-                    reciept_global_no=global_number + 1,
+                    reciept_global_no=global_number,
                     reciept_signature=receipt_device_signature_obj.sign_data()
                 )
                 
@@ -621,9 +743,9 @@ def submit_receipt(device_id):
                     'verification_number': verification_string,
                     'hash_string': receipt_device_signature_obj.get_hash(),
                     'is_fiscalized': True,
-                    'receipt_counter': counter + 1,
-                    'receipt_global_no': global_number + 1,
-                    'fiscal_day_number': str(open_fiscal_day.fiscal_day_no),
+                    'receipt_counter': len(receipt_lines),
+                    'receipt_global_no': global_number,
+                    'fiscal_day_number': str(last_fiscal_day.fiscal_day_no),
                     'receipt_notes': updated_data.get('receiptNotes', ''),
                     'tax_payer_name': device_config.tax_payer_name if device_config else config_data.get('taxPayerName', ''),
                     'tax_payer_tin': str(device_config.tax_payer_tin if device_config else config_data.get('taxPayerTIN', '')),
@@ -665,9 +787,9 @@ def submit_receipt(device_id):
                     "taxCode": "A",
                     "qrUrl": device_config.qr_url if device_config and device_config.qr_url else config_data.get('qrUrl', 'https://fdmstest.zimra.co.zw/'),
                     "deviceSerialNo": device_config.device_serial_no if device_config else config_data.get('deviceSerialNo', ''),
-                    "receiptCounter": counter + 1,
-                    "receiptGlobalNo": global_number + 1,
-                    "fiscalDayNumber": str(open_fiscal_day.fiscal_day_no),
+                    "receiptCounter": len(receipt_lines),
+                    "receiptGlobalNo": global_number,
+                    "fiscalDayNumber": str(last_fiscal_day.fiscal_day_no),
                     "receiptID": zimra_response.get('receiptID', ''),
                     "invoiceNumber": updated_data['invoiceNo'],
                     "deviceID": str(device_id),
@@ -675,6 +797,11 @@ def submit_receipt(device_id):
                     "taxPercentage": "15",
                     "qrString": qr_string,
                     "verificationCode": verification_string,
+                    # Include the calculated receipt data
+                    "receiptTaxes": updated_data.get('receiptTaxes', []),
+                    "receiptPayments": updated_data.get('receiptPayments', []),
+                    "receiptTotal": updated_data.get('receiptTotal', 0),
+                    "receiptLines": updated_data.get('receiptLines', [])
                 }
                 
                 return jsonify(response_data), 200
@@ -1197,6 +1324,83 @@ def get_invoice(invoice_id):
         return jsonify({"error": "Failed to fetch invoice", "details": str(e)}), 500
 
 
+@api.route('/invoices/<invoice_id>/pdf', methods=['GET'])
+def download_invoice_pdf(invoice_id):
+    """Download invoice as PDF using A4 template format"""
+    try:
+        invoice = Invoice.query.filter_by(invoice_id=invoice_id).first()
+        
+        if not invoice:
+            return jsonify({"error": "Invoice not found"}), 404
+        
+        # Get line items
+        line_items = InvoiceLineItem.query.filter_by(invoice_id=invoice.id).all()
+        
+        # Get branch address and contact
+        branch_address = DeviceBranchAddress.query.filter_by(invoice_id=invoice.id).first()
+        branch_contact = DeviceBranchContact.query.filter_by(invoice_id=invoice.id).first()
+        
+        # Prepare invoice data for template
+        invoice_data = {
+            'invoice_id': invoice.invoice_id,
+            'zimra_receipt_number': invoice.zimra_receipt_number,
+            'device_id': invoice.device_id,
+            'created_at': invoice.created_at.strftime('%Y-%m-%d %H:%M:%S') if invoice.created_at else 'N/A',
+            'is_fiscalized': invoice.is_fiscalized,
+            'receipt_type': invoice.receipt_type,
+            'money_type': invoice.money_type,
+            'receipt_counter': invoice.receipt_counter,
+            'receipt_global_no': invoice.receipt_global_no,
+            'fiscal_day_number': invoice.fiscal_day_number,
+            'operation_id': invoice.operation_id,
+            'verification_number': invoice.verification_number,
+            'hash_string': invoice.hash_string,
+            'tax_payer_name': invoice.tax_payer_name,
+            'tax_payer_tin': invoice.tax_payer_tin,
+            'vat_number': invoice.vat_number,
+            'device_branch_name': invoice.device_branch_name,
+            'debit_credit_note_invoice_ref_date': invoice.debit_credit_note_invoice_ref_date.strftime('%Y-%m-%d %H:%M:%S') if invoice.debit_credit_note_invoice_ref_date else None,
+            'receipt_total': invoice.receipt_total,
+            'notes': invoice.receipt_notes,
+            'qr_code_url': invoice.qr_code_string,
+            'branch_address': f"{branch_address.street}, {branch_address.house_no}, {branch_address.city}, {branch_address.province}" if branch_address else None,
+            'branch_contact': f"Email: {branch_contact.email}, Phone: {branch_contact.phone_number}" if branch_contact else None,
+            'line_items': []
+        }
+        
+        # Add line items
+        for item in line_items:
+            invoice_data['line_items'].append({
+                'receipt_line_name': item.receipt_line_name,
+                'receipt_line_quantity': item.receipt_line_quantity,
+                'receipt_line_price': item.receipt_line_price,
+                'receipt_line_total': item.receipt_line_total,
+                'tax_code': item.tax_code,
+                'tax_percent': item.tax_percent,
+                'receipt_line_hs_code': item.receipt_line_hs_code,
+                'tax_id': item.tax_id
+            })
+        
+        # Import and use the A4 template
+        from invoice_template import generate_invoice_pdf_a4_format
+        
+        # Generate PDF using A4 template
+        buffer = generate_invoice_pdf_a4_format(invoice_data)
+        
+        # Return PDF file
+        filename = f"invoice_{invoice.invoice_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        return send_file(
+            buffer,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='application/pdf'
+        )
+        
+    except Exception as e:
+        current_app.logger.error(f"Error generating PDF for invoice {invoice_id}: {str(e)}")
+        return jsonify({"error": "Failed to generate PDF", "details": str(e)}), 500
+
+
 @api.route('/invoices-ui', methods=['GET'])
 def invoices_ui():
     """Serve the invoice listing UI"""
@@ -1216,6 +1420,16 @@ def serve_static(filename):
     return send_from_directory('static', filename)
 
 
+@api.route('/static_files/<path:filename>')
+def serve_static_files(filename):
+    """Serve static files from static_files directory"""
+    import os
+    static_files_dir = os.path.join(os.getcwd(), 'static_files')
+    current_app.logger.debug(f"Serving static file: {filename} from directory: {static_files_dir}")
+    current_app.logger.debug(f"File exists: {os.path.exists(os.path.join(static_files_dir, filename))}")
+    return send_from_directory(static_files_dir, filename)
+
+
 @api.route('/', methods=['GET'])
 def index():
     """Serve the main index page"""
@@ -1227,3 +1441,142 @@ def index():
         return jsonify({"error": "Index file not found"}), 404
     except Exception as e:
         return jsonify({"error": "Failed to load index", "details": str(e)}), 500
+
+
+@api.route('/invoices/<invoice_id>/view', methods=['GET'])
+def view_invoice(invoice_id):
+    """View invoice details in HTML format using InvoiceA4 template"""
+    try:
+        invoice = Invoice.query.filter_by(invoice_id=invoice_id).first()
+        
+        if not invoice:
+            return jsonify({"error": "Invoice not found"}), 404
+        
+        # Get line items
+        line_items = InvoiceLineItem.query.filter_by(invoice_id=invoice.id).all()
+        
+        # Get branch address and contact
+        branch_address = DeviceBranchAddress.query.filter_by(invoice_id=invoice.id).first()
+        branch_contact = DeviceBranchContact.query.filter_by(invoice_id=invoice.id).first()
+        
+        # Calculate tax summaries
+        tax_summaries = []
+        tax_groups = {}
+        
+        for item in line_items:
+            tax_percent = item.tax_percent or 0
+            if tax_percent not in tax_groups:
+                tax_groups[tax_percent] = {
+                    'amount': 0,
+                    'vat_amount': 0,
+                    'tax_code': item.tax_code
+                }
+            
+            amount = item.receipt_line_total or 0
+            vat_amount = amount * (tax_percent / 100)
+            
+            tax_groups[tax_percent]['amount'] += amount
+            tax_groups[tax_percent]['vat_amount'] += vat_amount
+        
+        # Convert to list format for template
+        for tax_percent, data in sorted(tax_groups.items(), reverse=True):
+            if tax_percent > 0:
+                tax_summaries.append({
+                    'label': f"Total {tax_percent}%",
+                    'amount': data['amount'],
+                    'vat_amount': data['vat_amount']
+                })
+        
+        # Generate QR code image for HTML display
+        qr_code_image = None
+        if invoice.qr_code_string:
+            try:
+                import qrcode
+                import base64
+                from io import BytesIO
+                
+                qr = qrcode.QRCode(version=1, box_size=10, border=5)
+                qr.add_data(invoice.qr_code_string)
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
+                
+                # Convert to base64 for HTML display
+                buffer = BytesIO()
+                img.save(buffer, format='PNG')
+                buffer.seek(0)
+                qr_code_image = base64.b64encode(buffer.getvalue()).decode()
+            except Exception as e:
+                current_app.logger.warning(f"Could not generate QR code: {e}")
+        
+        # Prepare template data
+        template_data = {
+            'invoice': invoice,
+            'line_items': line_items,
+            'branch_address': branch_address,
+            'branch_contact': branch_contact,
+            'tax_summaries': tax_summaries,
+            'qr_code_image': qr_code_image
+        }
+        
+        # Use Jinja2 for template rendering
+        try:
+            from jinja2 import Environment, FileSystemLoader
+            
+            # Set up Jinja2 environment
+            env = Environment(loader=FileSystemLoader('static'))
+            template = env.get_template('invoice_a4_template.html')
+            
+            # Render the template
+            rendered_html = template.render(**template_data)
+            
+            return rendered_html, 200, {'Content-Type': 'text/html'}
+            
+        except ImportError:
+            # Fallback to simple template rendering if Jinja2 is not available
+            try:
+                with open('static/invoice_a4_template.html', 'r', encoding='utf-8') as f:
+                    template_content = f.read()
+                
+                # Simple template rendering
+                from string import Template
+                template = Template(template_content)
+                
+                # Convert template data to string format
+                rendered_html = template.safe_substitute(
+                    invoice_id=invoice.invoice_id,
+                    device_id=invoice.device_id,
+                    verification_number=invoice.verification_number or '-',
+                    qr_code_string=invoice.qr_code_string or '-',
+                    qr_code_image=qr_code_image or '',
+                    receipt_type=invoice.receipt_type or 'SALE',
+                    tax_payer_name=invoice.tax_payer_name or '-',
+                    tax_payer_tin=invoice.tax_payer_tin or '-',
+                    vat_number=invoice.vat_number or '',
+                    device_branch_name=invoice.device_branch_name or '-',
+                    receipt_counter=invoice.receipt_counter or '-',
+                    receipt_global_no=invoice.receipt_global_no or '-',
+                    zimra_receipt_number=invoice.zimra_receipt_number or '-',
+                    fiscal_day_number=invoice.fiscal_day_number or '-',
+                    created_at=invoice.created_at.strftime('%d/%m/%Y %H:%M') if invoice.created_at else '-',
+                    debit_credit_note_invoice_ref_date=invoice.debit_credit_note_invoice_ref_date.strftime('%d/%m/%Y %H:%M') if invoice.debit_credit_note_invoice_ref_date else '',
+                    receipt_total=f"{invoice.receipt_total:.2f}" if invoice.receipt_total else '0.00',
+                    notes=invoice.receipt_notes or '',
+                    branch_address_street=branch_address.street if branch_address else '',
+                    branch_address_house_no=branch_address.house_no if branch_address else '',
+                    branch_address_city=branch_address.city if branch_address else '',
+                    branch_address_province=branch_address.province if branch_address else '',
+                    branch_contact_email=branch_contact.email if branch_contact else '-',
+                    branch_contact_phone=branch_contact.phone_number if branch_contact else '-'
+                )
+                
+                return rendered_html, 200, {'Content-Type': 'text/html'}
+                
+            except FileNotFoundError:
+                return jsonify({"error": "Invoice template file not found"}), 404
+            except Exception as e:
+                current_app.logger.error(f"Error rendering invoice template: {str(e)}")
+                return jsonify({"error": "Failed to render invoice template", "details": str(e)}), 500
+        
+    except Exception as e:
+        current_app.logger.error(f"Error viewing invoice {invoice_id}: {str(e)}")
+        return jsonify({"error": "Failed to view invoice", "details": str(e)}), 500
