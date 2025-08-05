@@ -151,3 +151,14 @@ class DeviceBranchContact(db.Model):
     # Timestamps
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class DeviceGlobalNumber(db.Model):
+    __tablename__ = 'device_global_number'
+    id = db.Column(db.Integer, primary_key=True)
+    device_id = db.Column(db.String(50), db.ForeignKey('device_info.device_id'), nullable=False, unique=True)
+    current_global_number = db.Column(db.Integer, nullable=False, default=0)
+    
+    # Timestamps
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

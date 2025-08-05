@@ -296,6 +296,18 @@
             color: #667eea;
         }
 
+        .btn-download {
+            background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+            color: white;
+            border: none;
+        }
+
+        .btn-download:hover {
+            background: linear-gradient(135deg, #38a169 0%, #2f855a 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(72, 187, 120, 0.3);
+        }
+
         .pagination {
             display: flex;
             justify-content: center;
@@ -633,6 +645,14 @@
                             <i class="fas fa-eye"></i>
                             View Details
                         </button>
+                        <button class="btn btn-success btn-sm" onclick="viewInvoiceA4('${invoice.invoice_id}')">
+                            <i class="fas fa-file-invoice"></i>
+                            InvoiceA4 View
+                        </button>
+                        <button class="btn btn-download btn-sm" onclick="downloadPDF('${invoice.invoice_id}')">
+                            <i class="fas fa-download"></i>
+                            Download PDF
+                        </button>
                         ${invoice.qr_code_string ? `
                             <button class="btn btn-outline btn-sm" onclick="viewQR('${invoice.qr_code_string}')">
                                 <i class="fas fa-qrcode"></i>
@@ -759,6 +779,13 @@
                         <p>Phone: ${invoice.branch_contact.phone_number}</p>
                     </div>
                 ` : ''}
+
+                <div style="margin-top: 30px; text-align: center;">
+                    <button class="btn btn-download" onclick="downloadPDF('${invoice.invoice_id}')">
+                        <i class="fas fa-download"></i>
+                        Download PDF
+                    </button>
+                </div>
             `;
 
             modal.style.display = 'block';
@@ -766,6 +793,21 @@
 
         function closeModal() {
             document.getElementById('invoiceModal').style.display = 'none';
+        }
+
+        function downloadPDF(invoiceId) {
+            // Download PDF file
+            const link = document.createElement('a');
+            link.href = `/api/invoices/${invoiceId}/pdf`;
+            link.download = `invoice_${invoiceId}.pdf`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        function viewInvoiceA4(invoiceId) {
+            // Open InvoiceA4 view in a new tab
+            window.open(`/api/invoices/${invoiceId}/view`, '_blank');
         }
 
         function viewQR(qrString) {

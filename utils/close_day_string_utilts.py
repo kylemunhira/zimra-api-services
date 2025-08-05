@@ -76,26 +76,27 @@ def counters_extract_close_day(receipt_close: list) -> str:
         currency = counter.get('fiscalCounterCurrency')
         value = counter.get('fiscalCounterValue')
         money_type = counter.get('fiscalCounterMoneyType')
-        current_app.logger.debug(f"Ndasvika: {money_type}")
+        
         # Defensive: skip if essential keys missing or value is None
         if fiscal_type is None or currency is None or value is None:
             continue
 
-        # Multiply value by 100 and round
-        value_str = str(round(float(value) * 100)).replace(".00", "").replace(".0", "")
+        # Multiply value by 100 and round, ensure it's a positive integer
+        value_str = str(abs(round(float(value) * 100))).replace(".00", "").replace(".0", "")
 
         if fiscal_type != 'BalanceByMoneyType':
-
-            if "TaxByTax" in fiscal_type and (tax_percent == 0 or tax_percent is None):
-                # Skip this counter (empty string)
+            # Handle tax-related counters
+            if ("TaxByTax" in fiscal_type or "SaleByTax" in fiscal_type) and (tax_percent == 0 or tax_percent is None):
+                # Skip this counter (empty string) for zero tax
                 continue
             else:
                 if tax_percent is None or tax_id == 3:
+                    # For tax ID 3 (15% tax), don't include tax percent
                     string_to_sign_ += f"{fiscal_type}{currency}{value_str}"
                 else:
+                    # Include tax percent for other tax types
                     tax_percent_str = add_zeros(tax_percent)
                     string_to_sign_ += f"{fiscal_type}{currency}{tax_percent_str}{value_str}"
-
         else:
             # BalanceByMoneyType case
             if money_type is None:
@@ -140,6 +141,32 @@ def add_zeros(value):
         return str(value)
     
 import datetime
+
+def get_close_day_date_format(date_string: str) -> str:
+    """
+    Formats the close day date according to ZIMRA specifications.
+    
+    Parameters:
+        date_string (str): DateTime string in ISO format.
+        
+    Returns:
+        str: Formatted date string for close day operations.
+    """
+    try:
+        # Parse the ISO datetime string
+        date_object = datetime.datetime.strptime(date_string, "%Y-%m-%dT%H:%M:%S")
+        # Return in the format expected by ZIMRA for close day
+        # Use the same format as the input to ensure consistency
+        return date_object.strftime("%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        try:
+            # Try alternative format if the first one fails
+            date_object = datetime.datetime.strptime(date_string, "%Y-%m-%d %H:%M:%S")
+            return date_object.strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            # If parsing fails, return the original string
+            return date_string
+
 
 def get_date_only(date_string: str) -> str:
     """

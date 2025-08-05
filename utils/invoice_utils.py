@@ -60,12 +60,71 @@ def get_fiscal_day_counter(device_id: str, fiscal_open_date_time: str) -> int:
 
 
 def get_global_number(device_id: str) -> int:
-    """Get the global number for a device"""
-    # This is a simplified version - you might need to implement based on your business logic
+    """Get the global number for a device - simple approach"""
+    # Find the latest invoice for this device
     latest_invoice = Invoice.query.filter_by(device_id=device_id).order_by(Invoice.receipt_global_no.desc()).first()
+    
     if latest_invoice and latest_invoice.receipt_global_no is not None:
         return latest_invoice.receipt_global_no
     return 0
+
+
+def increment_global_number(device_id: str) -> int:
+    """
+    Simple approach: Find the last receipt's global number and increment it by 1.
+    
+    Args:
+        device_id (str): The device identifier
+        
+    Returns:
+        int: The incremented global number for the device
+    """
+    from flask import current_app
+    
+    # Find the latest invoice for this device
+    latest_invoice = Invoice.query.filter_by(device_id=device_id).order_by(Invoice.receipt_global_no.desc()).first()
+    
+    if latest_invoice and latest_invoice.receipt_global_no is not None:
+        # Get the last global number and increment by 1
+        last_global_number = latest_invoice.receipt_global_no
+        new_global_number = last_global_number + 1
+        current_app.logger.debug(f"Device {device_id}: Last global number was {last_global_number}, new global number is {new_global_number}")
+        return new_global_number
+    else:
+        # No previous invoices or no global number, start from 1
+        current_app.logger.debug(f"Device {device_id}: No previous global number found, starting from 1")
+        return 1
+
+
+def initialize_device_global_numbers():
+    """Initialize global number records for all devices that don't have one"""
+    from app import db
+    from app.models import DeviceGlobalNumber, DeviceInfo
+    
+    # Get all devices
+    devices = DeviceInfo.query.all()
+    
+    for device in devices:
+        # Check if device already has a global number record
+        existing_record = DeviceGlobalNumber.query.filter_by(device_id=device.device_id).first()
+        
+        if existing_record is None:
+            # Get the current highest global number from invoices
+            current_highest = get_global_number(device.device_id)
+            
+            # Create a new record
+            new_record = DeviceGlobalNumber(
+                device_id=device.device_id,
+                current_global_number=current_highest
+            )
+            db.session.add(new_record)
+    
+    try:
+        db.session.commit()
+        return True
+    except Exception as e:
+        db.session.rollback()
+        return False
 
 
 def get_fiscal_day_open_date_time(open_day_date_time: str) -> str:
@@ -89,26 +148,48 @@ def get_previous_hash(device_id: str, fiscal_open_date_time: str) -> str:
 
 def calculate_tax_summary(receipt_lines: list) -> dict:
     """Calculate tax summary from receipt lines with enhanced logic like Django"""
+    # Map letter tax codes to numeric codes for processing
+    tax_code_mapping = {
+        'A': '-1',   # Exempt (no tax)
+        'B': '0',    # 0% tax  
+        'C': '15',   # 15% tax
+        'D': '5'     # 5% tax
+    }
+    
     tax_summary = {
-        '15': {'taxCode': '15', 'taxPercent': 15.0, 'taxID': 1, 'taxAmount': 0, 'salesAmountWithTax': 0},
-        '0': {'taxCode': '0', 'taxPercent': 0.0, 'taxID': 2, 'taxAmount': 0, 'salesAmountWithTax': 0},
-        '-1': {'taxCode': None, 'taxPercent': 0.0, 'taxID': None, 'taxAmount': 0, 'salesAmountWithTax': 0},  # Exempt
-        '5': {'taxCode': '5', 'taxPercent': 5.0, 'taxID': 3, 'taxAmount': 0, 'salesAmountWithTax': 0}
+        '15': {'taxCode': 'C', 'taxPercent': 15.0, 'taxID': 3, 'taxAmount': 0.0, 'salesAmountWithTax': 0.0},
+        '0': {'taxCode': 'B', 'taxPercent': 0.0, 'taxID': 2, 'taxAmount': 0.0, 'salesAmountWithTax': 0.0},
+        '-1': {'taxCode': "A", 'taxPercent': 0.0, 'taxID': 1, 'taxAmount': 0.0, 'salesAmountWithTax': 0.0},  # Exempt
+        '5': {'taxCode': 'D', 'taxPercent': 5.0, 'taxID': 514, 'taxAmount': 0.0, 'salesAmountWithTax': 0.0}
     }
     
     for line in receipt_lines:
-        tax_code = str(line.get('taxCode', '15'))
-        tax_percent = float(line.get('taxPercent', 15.0))
+        original_tax_code = str(line.get('taxCode', '15'))
+        # Map letter codes to numeric codes for processing
+        tax_code = tax_code_mapping.get(original_tax_code.upper(), '15')
         line_total = float(line.get('receiptLineTotal', 0))
         
         # Map tax codes to the summary structure
         if tax_code in tax_summary:
-            tax_summary[tax_code]['taxAmount'] += line_total * (tax_percent / 100)
-            tax_summary[tax_code]['salesAmountWithTax'] += line_total
+            if tax_code == '-1':  # Exempt items
+                # For exempt items, no tax calculation, just add to sales amount
+                tax_summary[tax_code]['salesAmountWithTax'] += line_total
+            else:
+                # For non-exempt items, calculate tax
+                tax_percent = float(line.get('taxPercent', 15.0))
+                tax_amount = round(line_total * (tax_percent / 100), 2)
+                tax_summary[tax_code]['taxAmount'] += tax_amount
+                tax_summary[tax_code]['salesAmountWithTax'] += line_total + tax_amount
         else:
             # Default to 15% if tax code not found
-            tax_summary['15']['taxAmount'] += line_total * 0.15
-            tax_summary['15']['salesAmountWithTax'] += line_total
+            tax_amount = round(line_total * 0.15, 2)
+            tax_summary['15']['taxAmount'] += tax_amount
+            tax_summary['15']['salesAmountWithTax'] += line_total + tax_amount
+    
+    # Ensure all accumulated values are rounded to 2 decimal places
+    for tax_code in tax_summary:
+        tax_summary[tax_code]['taxAmount'] = round(tax_summary[tax_code]['taxAmount'], 2)
+        tax_summary[tax_code]['salesAmountWithTax'] = round(tax_summary[tax_code]['salesAmountWithTax'], 2)
     
     return tax_summary
 
@@ -117,20 +198,20 @@ def calculate_total_sales_amount_with_tax(tax_summary: list) -> float:
     """Calculate total sales amount with tax"""
     total = 0
     for tax in tax_summary:
-        total += float(tax.get('salesAmountWithTax', 0))
+        # salesAmountWithTax now already includes the tax amount
+        sales_amount_with_tax = float(tax.get('salesAmountWithTax', 0))
+        total += sales_amount_with_tax
     return total
 
 
 def get_tax_percentage(tax_code: str) -> float:
     """Get tax percentage for a tax code"""
     tax_percentages = {
-        'A': 0.0,
+        'A': 0.0,  # Exempt items - use 0.0 for database compatibility
         'B': 0.0,
         'C': 15.0,
-        'D': 0.0,
-        '15': 15.0,
-        '0': 0.0,
-        '5': 5.0
+        'D': 5.0,
+  
     }
     return tax_percentages.get(tax_code.upper(), 15.0)
 
@@ -141,10 +222,8 @@ def get_tax_id(tax_code: str) -> int:
         'A': 1,
         'B': 2,
         'C': 3,
-        'D': 4,
-        '15': 1,
-        '0': 2,
-        '5': 3
+        'D': 514,
+
     }
     return tax_ids.get(tax_code.upper(), 1)
 
@@ -196,6 +275,8 @@ def create_invoice(invoice_data: dict) -> Invoice:
 
 def update_fiscalized_invoice(update_data: dict) -> Invoice:
     """Update invoice with fiscalization data"""
+    from flask import current_app
+    
     invoice = Invoice.query.filter_by(invoice_id=update_data['invoice_id']).first()
     
     if not invoice:
@@ -333,6 +414,120 @@ def receipt_date_print() -> str:
 def get_credit_debit_note_invoice(device_id: str, receipt_id: str) -> Invoice:
     """Get the invoice referenced in a credit/debit note"""
     return Invoice.query.filter_by(device_id=device_id, zimra_receipt_number=receipt_id).first() 
+
+
+def generate_close_day_payload(device_id: str, fiscal_day_no: int) -> dict:
+    """
+    Generate the close day payload from database data.
+    
+    This function creates the payload required for the close day operation by:
+    1. Getting the fiscal day number
+    2. Calculating fiscal day counters from invoices in the fiscal day
+    3. Creating the proper payload structure
+    
+    Parameters:
+        device_id (str): The device ID
+        fiscal_day_no (int): The fiscal day number to close
+        
+    Returns:
+        dict: The close day payload with fiscalDayNo and fiscalDayCounters
+    """
+    # Get all invoices for this device and fiscal day
+    invoices = Invoice.query.filter_by(
+        device_id=device_id, 
+        fiscal_day_number=str(fiscal_day_no)
+    ).all()
+    
+    if not invoices:
+        raise ValueError(f"No invoices found for device {device_id} and fiscal day {fiscal_day_no}")
+    
+    # Initialize counters
+    tax_counters = {}
+    balance_counters = {}
+    
+    # Process each invoice to build counters
+    for invoice in invoices:
+        currency = invoice.receipt_currency
+        money_type = invoice.money_type
+        
+        # Get line items for this invoice
+        line_items = InvoiceLineItem.query.filter_by(invoice_id=invoice.id).all()
+        
+        for line_item in line_items:
+            tax_code = line_item.tax_code
+            tax_percent = line_item.tax_percent
+            tax_id = line_item.tax_id
+            line_total = line_item.receipt_line_total
+            
+            # Calculate tax amount
+            if tax_code == 'A':  # Exempt
+                tax_amount = 0.0
+            else:
+                tax_amount = round(line_total * (tax_percent / 100), 2)
+            
+            # Add to tax counters
+            tax_key = f"{tax_code}_{tax_percent}_{tax_id}"
+            if tax_key not in tax_counters:
+                tax_counters[tax_key] = {
+                    'taxCode': tax_code,
+                    'taxPercent': tax_percent,
+                    'taxID': tax_id,
+                    'currency': currency,
+                    'value': 0.0
+                }
+            tax_counters[tax_key]['value'] += line_total + tax_amount
+            
+            # Add to balance counters by money type
+            balance_key = f"{currency}_{money_type}"
+            if balance_key not in balance_counters:
+                balance_counters[balance_key] = {
+                    'currency': currency,
+                    'moneyType': money_type,
+                    'value': 0.0
+                }
+            balance_counters[balance_key]['value'] += line_total + tax_amount
+    
+    # Build fiscal day counters
+    fiscal_day_counters = []
+    
+    # Add tax counters
+    for tax_key, tax_data in tax_counters.items():
+        if tax_data['value'] > 0:  # Only include if there are sales
+            fiscal_day_counters.append({
+                'fiscalCounterType': 'SaleByTax',
+                'fiscalCounterTaxPercent': tax_data['taxPercent'],
+                'fiscalCounterTaxID': tax_data['taxID'],
+                'fiscalCounterCurrency': tax_data['currency'],
+                'fiscalCounterValue': round(tax_data['value'], 2),
+                'fiscalCounterMoneyType': 'CASH'  # Default, could be enhanced
+            })
+    
+    # Add balance counters
+    for balance_key, balance_data in balance_counters.items():
+        if balance_data['value'] > 0:  # Only include if there are sales
+            fiscal_day_counters.append({
+                'fiscalCounterType': 'BalanceByMoneyType',
+                'fiscalCounterTaxPercent': None,
+                'fiscalCounterTaxID': None,
+                'fiscalCounterCurrency': balance_data['currency'],
+                'fiscalCounterValue': round(balance_data['value'], 2),
+                'fiscalCounterMoneyType': balance_data['moneyType']
+            })
+    
+    # Calculate total receipt counter from all invoices
+    total_receipt_counter = sum(invoice.receipt_counter or 0 for invoice in invoices)
+    
+    # Create the payload
+    payload = {
+        'fiscalDayNo': str(fiscal_day_no),
+        'fiscalDayCounters': fiscal_day_counters,
+        'receiptCounter': total_receipt_counter  # Sum of all receipt counters in this fiscal day
+    }
+    
+    return payload
+
+
+
 
 
 def test_qr_string_generation():
