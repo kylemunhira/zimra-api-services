@@ -119,7 +119,7 @@ class InvoiceLineItem(db.Model):
     receipt_line_quantity = db.Column(db.Float, nullable=False)
     receipt_line_total = db.Column(db.Float, nullable=False)
     tax_code = db.Column(db.String(10), nullable=False)
-    tax_percent = db.Column(db.Float, nullable=False)
+    tax_percent = db.Column(db.Float, nullable=True)  # Allow NULL for exempt items
     tax_id = db.Column(db.Integer, nullable=False)
     
     # Timestamps

@@ -207,11 +207,10 @@ def calculate_total_sales_amount_with_tax(tax_summary: list) -> float:
 def get_tax_percentage(tax_code: str) -> float:
     """Get tax percentage for a tax code"""
     tax_percentages = {
-        'A': 0.0,  # Exempt items - use 0.0 for database compatibility
-        'B': 0.0,
-        'C': 15.0,
-        'D': 5.0,
-  
+        'A': None,  # Exempt items - should be None/null
+        'B': 0.0,   # 0% tax items
+        'C': 15.0,  # 15% tax items
+        'D': 5.0,   # 5% tax items
     }
     return tax_percentages.get(tax_code.upper(), 15.0)
 

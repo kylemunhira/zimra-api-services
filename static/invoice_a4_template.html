@@ -159,12 +159,12 @@
             <!-- Invoice Type Header -->
             <div class="row mb-3 text-center">
                 <div class="col-12">
-                    {% if invoice.receipt_type == 'SALE' %}
-                    <h6 class="invoice-header">FISCAL TAX INVOICE</h6>
-                    {% elif invoice.receipt_type == 'DEBIT_NOTE' %}
+                    {% if 'debit' in invoice.receipt_type.lower() %}
                     <h6 class="invoice-header">DEBIT NOTE</h6>
-                    {% else %}
+                    {% elif 'credit' in invoice.receipt_type.lower() %}
                     <h6 class="invoice-header">CREDIT NOTE</h6>
+                    {% else %}
+                    <h6 class="invoice-header">FISCAL TAX INVOICE</h6>
                     {% endif %}
                 </div>
             </div>
@@ -219,7 +219,7 @@
             <hr>
             <div class="row mb-3 text-center">
                 <div class="col-12">
-                    {% if invoice.receipt_type == 'DEBIT_NOTE' %}
+                    {% if 'debit' in invoice.receipt_type.lower() %}
                     <h6 class="invoice-header">DEBITED INVOICE</h6>
                     {% else %}
                     <h6 class="invoice-header">CREDITED INVOICE</h6>
@@ -276,7 +276,7 @@
                     </tr>
                     {% endfor %}
                     <tr class="total-row">
-                        <td colspan="5" class="text-end"><strong>Invoice total, ZWL</strong></td>
+                        <td colspan="5" class="text-end"><strong>Invoice total ({{ invoice.receipt_currency }})</strong></td>
                         <td class="text-end"><strong>{{ "%.2f"|format(invoice.receipt_total) }}</strong></td>
                     </tr>
                 </tfoot>
@@ -289,6 +289,24 @@
                     <p>{{ invoice.notes }}</p>
                 </div>
             </div>
+            {% endif %}
+            
+            <!-- Receipt Notes for Credit/Debit Notes -->
+            {% if 'debit' in invoice.receipt_type.lower() or 'credit' in invoice.receipt_type.lower() %}
+            {% if invoice.receipt_notes %}
+            <div class="row mb-3">
+                <div class="col-12">
+                    <div class="border-top pt-3">
+                        <h6 class="text-center mb-2"><strong>RECEIPT NOTES</strong></h6>
+                        <div class="row invoice-font">
+                            <div class="col-12">
+                                <p class="text-center">{{ invoice.receipt_notes }}</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
             {% endif %}
         </div>
         

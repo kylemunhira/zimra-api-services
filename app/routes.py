@@ -73,7 +73,28 @@ def get_fiscal_number(device_id: str) -> int:
     return fiscal_day.fiscal_day_no
 
 
+def get_latest_fiscal_number(device_id: str) -> int:
+    """
+    Returns the highest fiscal_day_no for a given device, regardless of open/closed status.
+    This is useful when you want the most recent fiscal day number, not necessarily the open one.
+    Raises ValueError if no fiscal day is found.
+    """
+    
+    device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+    current_app.logger.debug(f"mydeviceId: {device}")
 
+    # Get the highest fiscal day number (regardless of open/closed status)
+    fiscal_day = FiscalDay.query.filter_by(
+        device_id=device.device_id
+    ).order_by(FiscalDay.fiscal_day_no.desc()).first()
+    current_app.logger.debug(f"latest fiscalDay: no {fiscal_day.fiscal_day_no}")
+    if not fiscal_day:
+        raise ValueError(f"No fiscal day found for device_id: {device_id}")
+
+    if not fiscal_day.fiscal_day_no:
+        raise ValueError(f"fiscal_day_no not set for fiscal day of device_id: {device_id}")
+
+    return fiscal_day.fiscal_day_no
 
 
 def get_device_config(device_id):
@@ -392,7 +413,7 @@ def close_day(device_id):
         # 11. Send request to ZIMRA
         json_data = json.dumps(close_data)
         current_app.logger.debug(f"CloseDay Payload with signature: {json_data}")
-
+        #return jsonify(json_data), 200
         url = f'https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/CloseDay'
         response = session.post(url, data=json_data, headers=headers, verify=False)
 
@@ -1580,3 +1601,538 @@ def view_invoice(invoice_id):
     except Exception as e:
         current_app.logger.error(f"Error viewing invoice {invoice_id}: {str(e)}")
         return jsonify({"error": "Failed to view invoice", "details": str(e)}), 500
+
+
+@api.route('/fiscal_counters/<device_id>', methods=['GET'])
+def get_fiscal_counters(device_id):
+    """
+    Get fiscal counters for a specific device and fiscal day.
+    
+    This endpoint implements section 6. FISCAL COUNTERS from the ZIMRA API specification.
+    
+    Parameters:
+        device_id (str): Device identifier
+        fiscal_day_no (int, optional): Specific fiscal day number. If not provided, uses current open fiscal day.
+        
+    Returns:
+        JSON response with fiscal counter data
+    """
+    try:
+        # Get query parameters
+        fiscal_day_no = request.args.get('fiscal_day_no')
+        
+        # Load device config
+        device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+        if not device:
+            return jsonify({"error": "Device not found"}), 404
+
+        # Determine fiscal day number
+        if fiscal_day_no:
+            # Use provided fiscal day number
+            target_fiscal_day_no = int(fiscal_day_no)
+        else:
+            # Use current open fiscal day
+            try:
+                target_fiscal_day_no = get_fiscal_number(device_id)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 404
+
+        # Get fiscal day record
+        fiscal_day = FiscalDay.query.filter_by(
+            device_id=device.device_id,
+            fiscal_day_no=target_fiscal_day_no
+        ).first()
+        
+        if not fiscal_day:
+            return jsonify({"error": f"Fiscal day {target_fiscal_day_no} not found for device {device_id}"}), 404
+
+        # Get all invoices for this device and fiscal day
+        invoices = Invoice.query.filter_by(
+            device_id=str(device_id),
+            fiscal_day_number=str(target_fiscal_day_no)
+        ).all()
+
+        if not invoices:
+            return jsonify({
+                "error": f"No invoices found for device {device_id} and fiscal day {target_fiscal_day_no}",
+                "fiscal_day_no": target_fiscal_day_no,
+                "fiscal_day_open": fiscal_day.fiscal_day_open,
+                "is_open": fiscal_day.is_open,
+                "fiscal_counters": []
+            }), 404
+
+        # Generate fiscal counters using existing utility
+        from utils.generate_counters import generate_counters
+        
+        # Read private key for signature generation
+        with open(device.key_path, 'rb') as key_file:
+            private_key_data = key_file.read()
+        
+        # Generate counters
+        counters_data = generate_counters(
+            private_key=private_key_data,
+            device_id=str(device_id),
+            date_string=fiscal_day.fiscal_day_open,
+            close_day_date=fiscal_day.fiscal_day_open,
+            fiscal_day_no=target_fiscal_day_no
+        )
+        
+        # Update fiscal counter data (apply ZIMRA-specific formatting)
+        updated_counters = update_fiscal_counter_data(counters_data['fiscalDayCounters'])
+        
+        # Calculate summary statistics
+        total_receipts = len(invoices)
+        total_amount = sum(float(invoice.receipt_total or 0) for invoice in invoices)
+        
+        # Group counters by type for better organization
+        counters_by_type = {}
+        for counter in updated_counters:
+            counter_type = counter.get('fiscalCounterType', 'Unknown')
+            if counter_type not in counters_by_type:
+                counters_by_type[counter_type] = []
+            counters_by_type[counter_type].append(counter)
+        
+        # Prepare response data
+        response_data = {
+            "device_id": str(device_id),
+            "fiscal_day_no": target_fiscal_day_no,
+            "fiscal_day_open": fiscal_day.fiscal_day_open,
+            "fiscal_day_status": "OPEN" if fiscal_day.is_open else "CLOSED",
+            "total_receipts": total_receipts,
+            "total_amount": round(total_amount, 2),
+            "receipt_counter": counters_data.get('receiptCounter', 0),
+            "fiscal_counters": updated_counters,
+            "counters_by_type": counters_by_type,
+            "summary": {
+                "sale_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'SaleByTax']),
+                "tax_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'SaleTaxByTax']),
+                "balance_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'BalanceByMoneyType']),
+                "credit_note_counters": len([c for c in updated_counters if 'CreditNote' in c.get('fiscalCounterType', '')]),
+                "debit_note_counters": len([c for c in updated_counters if 'DebitNote' in c.get('fiscalCounterType', '')])
+            }
+        }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": format_exc()
+        }
+        current_app.logger.error(f"Fiscal counters error: {error_details}")
+        return jsonify(error_details), 500
+
+
+@api.route('/fiscal_counters/<device_id>/detailed', methods=['GET'])
+def get_detailed_fiscal_counters(device_id):
+    """
+    Get detailed fiscal counters with breakdown by currency, tax type, and payment method.
+    
+    This endpoint provides a more detailed view of fiscal counters for analysis.
+    """
+    try:
+        # Get query parameters
+        fiscal_day_no = request.args.get('fiscal_day_no')
+        
+        # Load device config
+        device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+        if not device:
+            return jsonify({"error": "Device not found"}), 404
+
+        # Determine fiscal day number
+        if fiscal_day_no:
+            target_fiscal_day_no = int(fiscal_day_no)
+        else:
+            try:
+                target_fiscal_day_no = get_fiscal_number(device_id)
+            except ValueError as e:
+                return jsonify({"error": str(e)}), 404
+
+        # Get fiscal day record
+        fiscal_day = FiscalDay.query.filter_by(
+            device_id=device.device_id,
+            fiscal_day_no=target_fiscal_day_no
+        ).first()
+        
+        if not fiscal_day:
+            return jsonify({"error": f"Fiscal day {target_fiscal_day_no} not found for device {device_id}"}), 404
+
+        # Get all invoices with line items
+        invoices = Invoice.query.filter_by(
+            device_id=str(device_id),
+            fiscal_day_number=str(target_fiscal_day_no)
+        ).all()
+
+        if not invoices:
+            return jsonify({
+                "error": f"No invoices found for device {device_id} and fiscal day {target_fiscal_day_no}",
+                "fiscal_day_no": target_fiscal_day_no,
+                "fiscal_day_open": fiscal_day.fiscal_day_open,
+                "is_open": fiscal_day.is_open,
+                "detailed_breakdown": {}
+            }), 404
+
+        # Calculate detailed breakdown
+        detailed_breakdown = {
+            "by_currency": {},
+            "by_tax_type": {},
+            "by_payment_method": {},
+            "by_receipt_type": {},
+            "invoice_details": []
+        }
+
+        # Process each invoice
+        for invoice in invoices:
+            line_items = InvoiceLineItem.query.filter_by(invoice_id=invoice.id).all()
+            
+            # Currency breakdown
+            currency = invoice.receipt_currency or 'ZWL'
+            if currency not in detailed_breakdown["by_currency"]:
+                detailed_breakdown["by_currency"][currency] = {
+                    "total_amount": 0.0,
+                    "total_tax": 0.0,
+                    "invoice_count": 0
+                }
+            detailed_breakdown["by_currency"][currency]["total_amount"] += float(invoice.receipt_total or 0)
+            detailed_breakdown["by_currency"][currency]["invoice_count"] += 1
+            
+            # Payment method breakdown
+            payment_method = invoice.money_type or 'Cash'
+            if payment_method not in detailed_breakdown["by_payment_method"]:
+                detailed_breakdown["by_payment_method"][payment_method] = {
+                    "total_amount": 0.0,
+                    "invoice_count": 0
+                }
+            detailed_breakdown["by_payment_method"][payment_method]["total_amount"] += float(invoice.receipt_total or 0)
+            detailed_breakdown["by_payment_method"][payment_method]["invoice_count"] += 1
+            
+            # Receipt type breakdown
+            receipt_type = invoice.receipt_type or 'SALE'
+            if receipt_type not in detailed_breakdown["by_receipt_type"]:
+                detailed_breakdown["by_receipt_type"][receipt_type] = {
+                    "total_amount": 0.0,
+                    "invoice_count": 0
+                }
+            detailed_breakdown["by_receipt_type"][receipt_type]["total_amount"] += float(invoice.receipt_total or 0)
+            detailed_breakdown["by_receipt_type"][receipt_type]["invoice_count"] += 1
+            
+            # Process line items for tax breakdown
+            for line_item in line_items:
+                tax_code = line_item.tax_code or 'C'
+                tax_percent = line_item.tax_percent or 15.0
+                tax_id = line_item.tax_id or 3
+                
+                tax_key = f"{tax_code}_{tax_percent}%"
+                if tax_key not in detailed_breakdown["by_tax_type"]:
+                    detailed_breakdown["by_tax_type"][tax_key] = {
+                        "tax_code": tax_code,
+                        "tax_percent": tax_percent,
+                        "tax_id": tax_id,
+                        "total_amount": 0.0,
+                        "total_tax": 0.0,
+                        "line_count": 0
+                    }
+                
+                line_total = float(line_item.receipt_line_total or 0)
+                tax_amount = float(line_item.tax_percent or 0) / 100 * line_total if line_item.tax_percent else 0
+                
+                detailed_breakdown["by_tax_type"][tax_key]["total_amount"] += line_total
+                detailed_breakdown["by_tax_type"][tax_key]["total_tax"] += tax_amount
+                detailed_breakdown["by_tax_type"][tax_key]["line_count"] += 1
+            
+            # Add invoice details
+            invoice_detail = {
+                "invoice_id": invoice.invoice_id,
+                "zimra_receipt_number": invoice.zimra_receipt_number,
+                "receipt_type": invoice.receipt_type,
+                "receipt_total": float(invoice.receipt_total or 0),
+                "receipt_currency": invoice.receipt_currency,
+                "money_type": invoice.money_type,
+                "is_fiscalized": invoice.is_fiscalized,
+                "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
+                "line_items_count": len(line_items)
+            }
+            detailed_breakdown["invoice_details"].append(invoice_detail)
+
+        # Round all amounts to 2 decimal places
+        for currency_data in detailed_breakdown["by_currency"].values():
+            currency_data["total_amount"] = round(currency_data["total_amount"], 2)
+            currency_data["total_tax"] = round(currency_data["total_tax"], 2)
+        
+        for payment_data in detailed_breakdown["by_payment_method"].values():
+            payment_data["total_amount"] = round(payment_data["total_amount"], 2)
+        
+        for receipt_data in detailed_breakdown["by_receipt_type"].values():
+            receipt_data["total_amount"] = round(receipt_data["total_amount"], 2)
+        
+        for tax_data in detailed_breakdown["by_tax_type"].values():
+            tax_data["total_amount"] = round(tax_data["total_amount"], 2)
+            tax_data["total_tax"] = round(tax_data["total_tax"], 2)
+
+        response_data = {
+            "device_id": str(device_id),
+            "fiscal_day_no": target_fiscal_day_no,
+            "fiscal_day_open": fiscal_day.fiscal_day_open,
+            "fiscal_day_status": "OPEN" if fiscal_day.is_open else "CLOSED",
+            "total_invoices": len(invoices),
+            "detailed_breakdown": detailed_breakdown
+        }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": format_exc()
+        }
+        current_app.logger.error(f"Detailed fiscal counters error: {error_details}")
+        return jsonify(error_details), 500
+
+
+@api.route('/fiscal_counters/<device_id>/<fiscal_day_no>', methods=['GET'])
+def get_fiscal_counters_by_day(device_id, fiscal_day_no):
+    """
+    Get fiscal counters for a specific device and fiscal day number.
+    
+    This endpoint allows explicit querying by device ID and fiscal day number.
+    
+    Parameters:
+        device_id (str): Device identifier (path parameter)
+        fiscal_day_no (int): Fiscal day number (path parameter)
+        
+    Returns:
+        JSON response with fiscal counter data
+    """
+    try:
+        # Convert fiscal day number to int
+        try:
+            target_fiscal_day_no = int(fiscal_day_no)
+        except ValueError:
+            return jsonify({"error": "Invalid fiscal day number. Must be an integer."}), 400
+        
+        # Load device config
+        device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+        if not device:
+            return jsonify({"error": "Device not found"}), 404
+
+        # Get fiscal day record
+        fiscal_day = FiscalDay.query.filter_by(
+            device_id=device.device_id,
+            fiscal_day_no=target_fiscal_day_no
+        ).first()
+        
+        if not fiscal_day:
+            return jsonify({
+                "error": f"Fiscal day {target_fiscal_day_no} not found for device {device_id}",
+                "device_id": device_id,
+                "fiscal_day_no": target_fiscal_day_no
+            }), 404
+
+        # Get all invoices for this device and fiscal day
+        invoices = Invoice.query.filter_by(
+            device_id=str(device_id),
+            fiscal_day_number=str(target_fiscal_day_no)
+        ).all()
+
+        # Generate fiscal counters using existing utility
+        from utils.generate_counters import generate_counters
+        
+        # Read private key for signature generation
+        with open(device.key_path, 'rb') as key_file:
+            private_key_data = key_file.read()
+        
+        # Generate counters
+        counters_data = generate_counters(
+            private_key=private_key_data,
+            device_id=str(device_id),
+            date_string=fiscal_day.fiscal_day_open,
+            close_day_date=fiscal_day.fiscal_day_open,
+            fiscal_day_no=target_fiscal_day_no
+        )
+        
+        # Update fiscal counter data (apply ZIMRA-specific formatting)
+        updated_counters = update_fiscal_counter_data(counters_data['fiscalDayCounters'])
+        
+        # Calculate summary statistics
+        total_receipts = len(invoices)
+        total_amount = sum(float(invoice.receipt_total or 0) for invoice in invoices)
+        
+        # Group counters by type for better organization
+        counters_by_type = {}
+        for counter in updated_counters:
+            counter_type = counter.get('fiscalCounterType', 'Unknown')
+            if counter_type not in counters_by_type:
+                counters_by_type[counter_type] = []
+            counters_by_type[counter_type].append(counter)
+        
+        # Group counters by currency
+        counters_by_currency = {}
+        for counter in updated_counters:
+            currency = counter.get('fiscalCounterCurrency', 'Unknown')
+            if currency not in counters_by_currency:
+                counters_by_currency[currency] = []
+            counters_by_currency[currency].append(counter)
+        
+        # Prepare response data
+        response_data = {
+            "device_id": str(device_id),
+            "fiscal_day_no": target_fiscal_day_no,
+            "fiscal_day_open": fiscal_day.fiscal_day_open,
+            "fiscal_day_status": "OPEN" if fiscal_day.is_open else "CLOSED",
+            "total_receipts": total_receipts,
+            "total_amount": round(total_amount, 2),
+            "receipt_counter": counters_data.get('receiptCounter', 0),
+            "fiscal_counters": updated_counters,
+            "counters_by_type": counters_by_type,
+            "counters_by_currency": counters_by_currency,
+            "summary": {
+                "sale_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'SaleByTax']),
+                "tax_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'SaleTaxByTax']),
+                "balance_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'BalanceByMoneyType']),
+                "credit_note_counters": len([c for c in updated_counters if 'CreditNote' in c.get('fiscalCounterType', '')]),
+                "debit_note_counters": len([c for c in updated_counters if 'DebitNote' in c.get('fiscalCounterType', '')])
+            },
+            "query_info": {
+                "device_id": device_id,
+                "fiscal_day_no": target_fiscal_day_no,
+                "total_counters": len(updated_counters),
+                "currencies": list(counters_by_currency.keys())
+            }
+        }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": format_exc()
+        }
+        current_app.logger.error(f"Fiscal counters query error: {error_details}")
+        return jsonify(error_details), 500
+
+
+@api.route('/fiscal_counters/<device_id>/latest', methods=['GET'])
+def get_fiscal_counters_latest(device_id):
+    """
+    Get fiscal counters for a specific device using the latest (current) fiscal day.
+    
+    This endpoint automatically uses the latest fiscal day number for the device.
+    
+    Parameters:
+        device_id (str): Device identifier (path parameter)
+        
+    Returns:
+        JSON response with fiscal counter data for the latest fiscal day
+    """
+    try:
+        # Load device config
+        device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+        if not device:
+            return jsonify({"error": "Device not found"}), 404
+
+        # Get the latest fiscal day number (highest number, regardless of open/closed status)
+        try:
+            target_fiscal_day_no = get_latest_fiscal_number(device_id)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
+
+        # Get fiscal day record
+        fiscal_day = FiscalDay.query.filter_by(
+            device_id=device.device_id,
+            fiscal_day_no=target_fiscal_day_no
+        ).first()
+        
+        if not fiscal_day:
+            return jsonify({
+                "error": f"Latest fiscal day {target_fiscal_day_no} not found for device {device_id}",
+                "device_id": device_id,
+                "fiscal_day_no": target_fiscal_day_no
+            }), 404
+
+        # Get all invoices for this device and fiscal day
+        invoices = Invoice.query.filter_by(
+            device_id=str(device_id),
+            fiscal_day_number=str(target_fiscal_day_no)
+        ).all()
+
+        # Generate fiscal counters using existing utility
+        from utils.generate_counters import generate_counters
+        
+        # Read private key for signature generation
+        with open(device.key_path, 'rb') as key_file:
+            private_key_data = key_file.read()
+        
+        # Generate counters
+        counters_data = generate_counters(
+            private_key=private_key_data,
+            device_id=str(device_id),
+            date_string=fiscal_day.fiscal_day_open,
+            close_day_date=fiscal_day.fiscal_day_open,
+            fiscal_day_no=target_fiscal_day_no
+        )
+        
+        # Update fiscal counter data (apply ZIMRA-specific formatting)
+        updated_counters = update_fiscal_counter_data(counters_data['fiscalDayCounters'])
+        
+        # Calculate summary statistics
+        total_receipts = len(invoices)
+        total_amount = sum(float(invoice.receipt_total or 0) for invoice in invoices)
+        
+        # Group counters by type for better organization
+        counters_by_type = {}
+        for counter in updated_counters:
+            counter_type = counter.get('fiscalCounterType', 'Unknown')
+            if counter_type not in counters_by_type:
+                counters_by_type[counter_type] = []
+            counters_by_type[counter_type].append(counter)
+        
+        # Group counters by currency
+        counters_by_currency = {}
+        for counter in updated_counters:
+            currency = counter.get('fiscalCounterCurrency', 'Unknown')
+            if currency not in counters_by_currency:
+                counters_by_currency[currency] = []
+            counters_by_currency[currency].append(counter)
+        
+        # Prepare response data
+        response_data = {
+            "device_id": str(device_id),
+            "fiscal_day_no": target_fiscal_day_no,
+            "fiscal_day_open": fiscal_day.fiscal_day_open,
+            "fiscal_day_status": "OPEN" if fiscal_day.is_open else "CLOSED",
+            "total_receipts": total_receipts,
+            "total_amount": round(total_amount, 2),
+            "receipt_counter": counters_data.get('receiptCounter', 0),
+            "fiscal_counters": updated_counters,
+            "counters_by_type": counters_by_type,
+            "counters_by_currency": counters_by_currency,
+            "summary": {
+                "sale_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'SaleByTax']),
+                "tax_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'SaleTaxByTax']),
+                "balance_counters": len([c for c in updated_counters if c.get('fiscalCounterType') == 'BalanceByMoneyType']),
+                "credit_note_counters": len([c for c in updated_counters if 'CreditNote' in c.get('fiscalCounterType', '')]),
+                "debit_note_counters": len([c for c in updated_counters if 'DebitNote' in c.get('fiscalCounterType', '')])
+            },
+            "query_info": {
+                "device_id": device_id,
+                "fiscal_day_no": target_fiscal_day_no,
+                "total_counters": len(updated_counters),
+                "currencies": list(counters_by_currency.keys()),
+                "is_latest": True,
+                "note": "Using latest fiscal day number"
+            }
+        }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": format_exc()
+        }
+        current_app.logger.error(f"Latest fiscal counters query error: {error_details}")
+        return jsonify(error_details), 500
