@@ -153,4 +153,4 @@ class ZimraConfig:
 
 # Global configuration instance
 # Set test_mode=True for test environment, False for production
-zimra_config = ZimraConfig(test_mode=True)  # Production mode enabled
+zimra_config = ZimraConfig(test_mode=False)  # Production mode enabled
