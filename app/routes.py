@@ -1,12 +1,13 @@
 from flask import Blueprint, jsonify, request, current_app, send_from_directory, render_template_string, send_file
 from app.models import DeviceInfo, FiscalDay, Invoice, InvoiceLineItem, DeviceBranchAddress, DeviceBranchContact, DeviceConfiguration
+from app.config import zimra_config
 from app import db
 from utils.close_day_string_utilts import generate_close_day_string, add_zeros
 from utils.date_utils import  get_close_day_string_date
-from utils.generate_counters import generate_counters
+from utils.generate_counters import generate_counters, analyze_invoice_currencies_and_taxes
 from utils.update_closeday import update_fiscal_counter_data
 from utils.invoice_utils import (
-    invoice_exists, get_fiscal_day_counter, get_global_number, calculate_tax_summary,
+    invoice_exists, get_existing_invoice_info, get_fiscal_day_counter, get_global_number, calculate_tax_summary,
     calculate_total_sales_amount_with_tax, create_invoice_line_items, create_invoice,
     update_fiscalized_invoice, qr_string_generator, base64_to_hex_md5,
     qr_date, receipt_date_print, get_fiscal_day_open_date_time, get_previous_hash,
@@ -202,7 +203,7 @@ def get_status(device_id):
             "DeviceModelVersion": device_config["model_version_number"]
         }
 
-        zimra_url = f"https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/GetStatus"
+        zimra_url = zimra_config.get_api_url(device_id, "GetStatus")
         current_app.logger.debug(f"Target URL: {zimra_url}")
            
 
@@ -271,7 +272,7 @@ def open_day(device_id):
     current_app.logger.debug(f"OpenDay Payload: {json_data}")
 
     try:
-        url = f'https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/OpenDay'
+        url = zimra_config.get_api_url(device_id, "OpenDay")
         response = session.post(url, data=json_data, headers=headers, verify=False)
 
         current_app.logger.debug(f"OpenDay Response status: {response.status_code}")
@@ -329,29 +330,25 @@ def close_day(device_id):
         if not open_fiscal_day:
             return jsonify({"error": f"No open fiscal day {fiscal_day_number} found for this device"}), 404
 
-        # Use the fiscal day open date for closing (this is the correct approach)
-        fiscal_close_date = open_fiscal_day.fiscal_day_open
-        
-        # Format the close date properly for signature generation
-        from utils.close_day_string_utilts import get_close_day_date_format
-        formatted_close_date = get_close_day_date_format(fiscal_close_date)
+        # Use the current close date for signing as per ZIMRA spec
+        fiscal_close_date = get_close_day_string_date()
+        formatted_close_date = fiscal_close_date
         
         # 4. Generate counters using Django-style approach
         try:
-            # Read private key for generate_counters
-            with open(key_path, 'rb') as key_file:
-                private_key_data = key_file.read()
+            # Read private key as string for generate_counters (same as Django implementation)
+            with open(key_path, 'r') as key_file:
+                private_key_string = key_file.read()
             
             # Generate the close day data using generate_counters
             close_data = generate_counters(
-                private_key=private_key_data,
+                private_key=private_key_string,
                 device_id=str(device_id),
                 date_string=open_fiscal_day.fiscal_day_open,
                 close_day_date=fiscal_close_date,
                 fiscal_day_no=int(fiscal_day_number)  # Use the fiscal day number from get_fiscal_number
             )
-            
-            current_app.logger.debug(f"Generated CloseDay data: {close_data}")
+    
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
 
@@ -359,43 +356,42 @@ def close_day(device_id):
         updated_counters = update_fiscal_counter_data(close_data['fiscalDayCounters'])
         close_data['fiscalDayCounters'] = updated_counters
 
-        # 6. Generate string to sign using the correct format
+        # 6. Generate string to sign using the canonical format (no dynamic Base64 counters)
         string_to_sign = generate_close_day_string(
             device_id=str(device_id),
             fiscal_day_no=fiscal_day_number,
             date=formatted_close_date,
             receipt_close=close_data
         )
-        
-        current_app.logger.debug(f"String to sign for CloseDay: {string_to_sign}")
 
-        # 7. Generate the signature using the device's private key
-        with open(key_path, 'rb') as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=None
-            )
+        current_app.logger.debug(f"String to sign for CloseDay: {string_to_sign}")
+        #return jsonify(string_to_sign), 200
+        # 7. Generate the signature using ReceiptDeviceSignature class (same as Django implementation)
+        # Read private key as string for signature generation (same as Django implementation)
+        with open(key_path, 'r') as key_file:
+            private_key_string = key_file.read()
         
-        # Sign the string using SHA256 with PKCS1v15 padding
-        signature = private_key.sign(
-            string_to_sign.encode('utf-8'),
-            padding.PKCS1v15(),
-            hashes.SHA256()
+        # Create ReceiptDeviceSignature object
+        receipt_device_signature = ReceiptDeviceSignature(
+            string_to_sign=string_to_sign, 
+            private_key=private_key_string
         )
         
-        # Encode signature to base64
-        fiscal_day_device_signature = base64.b64encode(signature).decode('utf-8')
+        # Generate signature (RSA-SHA256 over the original data) and SHA256 base64 hash of the data
+        fiscal_day_device_signature = receipt_device_signature.sign_data()
+        signature_hash = receipt_device_signature.get_hash()
         
-        # 8. Add the signature to the payload
-        # Generate MD5 hash of the signature (16 characters, uppercase)
-        signature_bytes = base64.b64decode(fiscal_day_device_signature)
-        md5_hash = hashlib.md5(signature_bytes).hexdigest().upper()
-        signature_hash = md5_hash[:16]  # Take first 16 characters
         
-        # Ensure the signature format matches ZIMRA expectations
-        close_data['fiscalDayDeviceSignature'] = {
-            "hash": signature_hash,
-            "signature": fiscal_day_device_signature
+        
+        # Create the final payload in the correct ZIMRA format order
+        final_payload = {
+            "fiscalDayNo": close_data['fiscalDayNo'],
+            "fiscalDayCounters": close_data['fiscalDayCounters'],
+            "fiscalDayDeviceSignature": {
+                "hash": signature_hash,
+                "signature": fiscal_day_device_signature
+            },
+            "receiptCounter": close_data['receiptCounter']
         }
         
         # 9. Prepare secure session with ZIMRA
@@ -411,10 +407,10 @@ def close_day(device_id):
         }
 
         # 11. Send request to ZIMRA
-        json_data = json.dumps(close_data)
+        json_data = json.dumps(final_payload)
         current_app.logger.debug(f"CloseDay Payload with signature: {json_data}")
-        #return jsonify(json_data), 200
-        url = f'https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/CloseDay'
+        return jsonify(json_data), 200
+        url = zimra_config.get_api_url(device_id, "CloseDay")
         response = session.post(url, data=json_data, headers=headers, verify=False)
 
         current_app.logger.debug(f"ZIMRA CloseDay status: {response.status_code}")
@@ -455,6 +451,102 @@ def close_day(device_id):
         current_app.logger.error(f"CloseDay error: {error_details}")
         return jsonify(error_details), 500
     
+
+@api.route('/close_day/<device_id>/summary', methods=['GET'])
+def close_day_summary(device_id):
+    """
+    Get a summary of the current open fiscal day for close day operation.
+    
+    This endpoint provides information about the current open fiscal day
+    including invoice counts, amounts, and readiness for closure.
+    
+    Parameters:
+        device_id (str): Device identifier (path parameter)
+        
+    Returns:
+        JSON response with fiscal day summary
+    """
+    try:
+        # Get device info
+        device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+        if not device:
+            return jsonify({
+                "success": False,
+                "error": f"Device not found: {device_id}"
+            }), 404
+        
+        # Get current open fiscal day
+        fiscal_day = FiscalDay.query.filter_by(
+            device_id=device.device_id,
+            is_open=True
+        ).order_by(FiscalDay.fiscal_day_no.desc()).first()
+        
+        if not fiscal_day:
+            return jsonify({
+                "success": False,
+                "error": f"No open fiscal day found for device: {device_id}"
+            }), 404
+        
+        fiscal_day_no = fiscal_day.fiscal_day_no
+        
+        # Get invoices for this fiscal day
+        invoices = Invoice.query.filter_by(
+            device_id=str(device_id),
+            fiscal_day_number=str(fiscal_day_no)
+        ).all()
+        
+        # Calculate summary
+        total_invoices = len(invoices)
+        total_amount = sum(float(inv.receipt_total or 0) for inv in invoices)
+        total_receipt_counter = sum(inv.receipt_counter or 0 for inv in invoices)
+        
+        # Get currency breakdown
+        currency_breakdown = {}
+        for invoice in invoices:
+            currency = invoice.receipt_currency or 'ZWG'
+            if currency not in currency_breakdown:
+                currency_breakdown[currency] = {'count': 0, 'amount': 0.0}
+            currency_breakdown[currency]['count'] += 1
+            currency_breakdown[currency]['amount'] += float(invoice.receipt_total or 0)
+        
+        # Get device configuration
+        device_config = DeviceConfiguration.query.filter_by(device_id=device.device_id).first()
+        
+        summary = {
+            "device_id": device_id,
+            "fiscal_day_no": fiscal_day_no,
+            "fiscal_day_open_date": fiscal_day.fiscal_day_open,
+            "total_invoices": total_invoices,
+            "total_amount": round(total_amount, 2),
+            "total_receipt_counter": total_receipt_counter,
+            "currency_breakdown": currency_breakdown,
+            "device_info": {
+                "device_model_name": device.model_name,
+                "device_model_version": device.model_version,
+                "tax_payer_name": device_config.tax_payer_name if device_config else None,
+                "tax_payer_tin": device_config.tax_payer_tin if device_config else None,
+                "vat_number": device_config.vat_number if device_config else None,
+                "branch_name": device_config.device_branch_name if device_config else None
+            },
+            "status": "ready_for_close" if total_invoices > 0 else "no_invoices",
+            "certificate_path": device.certificate_path,
+            "key_path": device.key_path
+        }
+        
+        return jsonify({
+            "success": True,
+            "data": summary
+        }), 200
+        
+    except Exception as e:
+        error_details = {
+            "success": False,
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": format_exc()
+        }
+        current_app.logger.error(f"Close day summary error: {error_details}")
+        return jsonify(error_details), 500
 
 
 @api.route('/submit_receipt/<device_id>', methods=['POST'])
@@ -497,8 +589,25 @@ def submit_receipt(device_id):
             return jsonify({"error": "No fiscal day found for this device"}), 404
 
         # 4. Check for duplicate invoice
-        if invoice_exists(device_id=str(device_id), invoice_id=str(receipt_data["invoiceNo"])):
-            return jsonify({"error": "Duplication Of Invoice Number"}), 400
+        invoice_number = str(receipt_data["invoiceNo"])
+        existing_invoice_info = get_existing_invoice_info(device_id=str(device_id), invoice_id=invoice_number)
+        
+        if existing_invoice_info["exists"]:
+            return jsonify({
+                "error": "Duplicate Invoice Detected",
+                "message": f"Invoice number '{invoice_number}' already exists for device '{device_id}'",
+                "device_id": device_id,
+                "invoice_number": invoice_number,
+                "details": "Duplicate prevention: Invoice number and device ID combination must be unique",
+                "existing_invoice": {
+                    "receipt_type": existing_invoice_info.get("receipt_type"),
+                    "receipt_total": existing_invoice_info.get("receipt_total"),
+                    "is_fiscalized": existing_invoice_info.get("is_fiscalized"),
+                    "created_at": existing_invoice_info.get("created_at"),
+                    "zimra_receipt_number": existing_invoice_info.get("zimra_receipt_number"),
+                    "fiscal_day_number": existing_invoice_info.get("fiscal_day_number")
+                }
+            }), 400
 
         # 5. Calculate counters and get previous hash
         formatted_datetime = get_submit_receipt_date()
@@ -576,13 +685,8 @@ def submit_receipt(device_id):
         # Create tax objects based on actual tax codes used in receipt lines
         filtered_taxes = []
         
-        # Map tax codes to their proper structure
-        tax_mapping = {
-            '15': {'taxCode': '15', 'taxPercent': 15.0, 'taxID': 3},
-            '0': {'taxCode': '0', 'taxPercent': 0.0, 'taxID': 2},
-            '-1': {'taxCode': None, 'taxID': 1},  # Exempt - no taxPercent
-            '5': {'taxCode': '5', 'taxPercent': 5.0, 'taxID': 514}
-        }
+        # Map tax codes to their proper structure using configuration
+        tax_mapping = zimra_config.get_tax_mapping()
         
         # Check if this is a credit/debit note
         is_credit_debit_note = updated_data.get('creditDebitNote') is not None
@@ -619,8 +723,8 @@ def submit_receipt(device_id):
                     tax_object['taxAmount'] = abs(tax_data['taxAmount'])
                     tax_object['salesAmountWithTax'] = abs(tax_data['salesAmountWithTax'])
                 
-                # Add taxPercent only for non-exempt items (exempt items have taxID 1)
-                if tax_data['taxID'] != 1:
+                # Add taxPercent only for non-exempt items
+                if not zimra_config.is_exempt_tax_id(tax_data['taxID']):
                     tax_object['taxPercent'] = tax_data['taxPercent']
                 
                 filtered_taxes.append(tax_object)
@@ -681,7 +785,7 @@ def submit_receipt(device_id):
         }
 
         # 14. Send request to ZIMRA
-        url = f'https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/SubmitReceipt'
+        url = zimra_config.get_api_url(device_id, "SubmitReceipt")
         
         # Debug: Log the calculated values before sending
         current_app.logger.debug(f"Calculated receiptTotal: {updated_data.get('receiptTotal')}")
@@ -723,7 +827,7 @@ def submit_receipt(device_id):
                 created_invoice = create_invoice(invoice_data)
                 
                 # Generate QR code using stored QR URL from device config
-                qr_url = device_config.qr_url if device_config and device_config.qr_url else "https://fdmstest.zimra.co.zw/"
+                qr_url = device_config.qr_url if device_config and device_config.qr_url else zimra_config.qr_url
                 qr_string = qr_string_generator(
                     device_id=str(device_id),
                     qr_url=qr_url,
@@ -806,7 +910,7 @@ def submit_receipt(device_id):
                         "email": device_config.device_branch_contacts_email if device_config else config_data.get('deviceBranchContacts', {}).get('email', '')
                     },
                     "taxCode": "A",
-                    "qrUrl": device_config.qr_url if device_config and device_config.qr_url else config_data.get('qrUrl', 'https://fdmstest.zimra.co.zw/'),
+                    "qrUrl": device_config.qr_url if device_config and device_config.qr_url else config_data.get('qrUrl', zimra_config.qr_url),
                     "deviceSerialNo": device_config.device_serial_no if device_config else config_data.get('deviceSerialNo', ''),
                     "receiptCounter": len(receipt_lines),
                     "receiptGlobalNo": global_number,
@@ -1037,7 +1141,7 @@ def get_config(device_id):
       #  requests.get(url, verify='zimra-root-ca.pem')
         print("CloseDay Data ##########3")
         # Send request to ZIMRA API
-        url = f'https://fdmsapitest.zimra.co.zw/Device/v1/{device_id}/GetConfig'
+        url = zimra_config.get_api_url(device_id, "GetConfig")
         #requests.get(url, verify='zimra-root-ca.pem')
         print("CloseDay Data ##########4")
         response = session.get(url, headers=headers, verify=False)
@@ -1435,33 +1539,14 @@ def invoices_ui():
         return jsonify({"error": "Failed to load invoice UI", "details": str(e)}), 500
 
 
-@api.route('/static/<path:filename>')
-def serve_static(filename):
-    """Serve static files"""
-    return send_from_directory('static', filename)
+# Static files are now served by Flask's built-in static file serving
+# No need for custom route - Flask will automatically serve files from static/ directory
 
 
-@api.route('/static_files/<path:filename>')
-def serve_static_files(filename):
-    """Serve static files from static_files directory"""
-    import os
-    static_files_dir = os.path.join(os.getcwd(), 'static_files')
-    current_app.logger.debug(f"Serving static file: {filename} from directory: {static_files_dir}")
-    current_app.logger.debug(f"File exists: {os.path.exists(os.path.join(static_files_dir, filename))}")
-    return send_from_directory(static_files_dir, filename)
+# Static files serving moved to main app in __init__.py
 
 
-@api.route('/', methods=['GET'])
-def index():
-    """Serve the main index page"""
-    try:
-        with open('static/index.html', 'r', encoding='utf-8') as f:
-            html_content = f.read()
-        return html_content, 200, {'Content-Type': 'text/html'}
-    except FileNotFoundError:
-        return jsonify({"error": "Index file not found"}), 404
-    except Exception as e:
-        return jsonify({"error": "Failed to load index", "details": str(e)}), 500
+# Root route moved to main app in __init__.py
 
 
 @api.route('/invoices/<invoice_id>/view', methods=['GET'])
@@ -2136,3 +2221,165 @@ def get_fiscal_counters_latest(device_id):
         }
         current_app.logger.error(f"Latest fiscal counters query error: {error_details}")
         return jsonify(error_details), 500
+
+
+@api.route('/fiscal_counters/<device_id>/<fiscal_day_no>/analysis', methods=['GET'])
+def analyze_fiscal_counters_data(device_id, fiscal_day_no):
+    """
+    Analyze which currencies and taxes are actually used in invoices for a specific device and fiscal day.
+    
+    This endpoint helps understand what counters will be generated and provides detailed breakdown
+    of currencies, taxes, and payment methods used in the invoices.
+    
+    Parameters:
+        device_id (str): Device identifier (path parameter)
+        fiscal_day_no (int): Fiscal day number (path parameter)
+        
+    Returns:
+        JSON response with detailed analysis of used currencies, taxes, and payment methods
+    """
+    try:
+        # Convert fiscal day number to int
+        try:
+            target_fiscal_day_no = int(fiscal_day_no)
+        except ValueError:
+            return jsonify({"error": "Invalid fiscal day number. Must be an integer."}), 400
+        
+        # Load device config
+        device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+        if not device:
+            return jsonify({"error": "Device not found"}), 404
+
+        # Get fiscal day record
+        fiscal_day = FiscalDay.query.filter_by(
+            device_id=device.device_id,
+            fiscal_day_no=target_fiscal_day_no
+        ).first()
+        
+        if not fiscal_day:
+            return jsonify({
+                "error": f"Fiscal day {target_fiscal_day_no} not found for device {device_id}",
+                "device_id": device_id,
+                "fiscal_day_no": target_fiscal_day_no
+            }), 404
+
+        # Analyze currencies and taxes
+        analysis_data = analyze_invoice_currencies_and_taxes(device_id, target_fiscal_day_no)
+        
+        # Add fiscal day information
+        analysis_data.update({
+            "fiscal_day_open": fiscal_day.fiscal_day_open,
+            "fiscal_day_status": "OPEN" if fiscal_day.is_open else "CLOSED"
+        })
+        
+        return jsonify(analysis_data), 200
+        
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": format_exc()
+        }
+        current_app.logger.error(f"Fiscal counters analysis error: {error_details}")
+        return jsonify(error_details), 500
+
+
+@api.route('/fiscal_counters/<device_id>/analysis/latest', methods=['GET'])
+def analyze_fiscal_counters_data_latest(device_id):
+    """
+    Analyze which currencies and taxes are actually used in invoices for the latest fiscal day.
+    
+    This endpoint automatically uses the latest fiscal day number for the device.
+    
+    Parameters:
+        device_id (str): Device identifier (path parameter)
+        
+    Returns:
+        JSON response with detailed analysis of used currencies, taxes, and payment methods
+    """
+    try:
+        # Load device config
+        device = DeviceInfo.query.filter_by(device_id=str(device_id)).first()
+        if not device:
+            return jsonify({"error": "Device not found"}), 404
+
+        # Get the latest fiscal day number (highest number, regardless of open/closed status)
+        try:
+            target_fiscal_day_no = get_latest_fiscal_number(device_id)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 404
+
+        # Get fiscal day record
+        fiscal_day = FiscalDay.query.filter_by(
+            device_id=device.device_id,
+            fiscal_day_no=target_fiscal_day_no
+        ).first()
+        
+        if not fiscal_day:
+            return jsonify({
+                "error": f"Latest fiscal day {target_fiscal_day_no} not found for device {device_id}",
+                "device_id": device_id,
+                "fiscal_day_no": target_fiscal_day_no
+            }), 404
+
+        # Analyze currencies and taxes
+        analysis_data = analyze_invoice_currencies_and_taxes(device_id, target_fiscal_day_no)
+        
+        # Add fiscal day information
+        analysis_data.update({
+            "fiscal_day_open": fiscal_day.fiscal_day_open,
+            "fiscal_day_status": "OPEN" if fiscal_day.is_open else "CLOSED",
+            "is_latest": True,
+            "note": "Using latest fiscal day number"
+        })
+        
+        return jsonify(analysis_data), 200
+        
+    except Exception as e:
+        error_details = {
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "traceback": format_exc()
+        }
+        current_app.logger.error(f"Latest fiscal counters analysis error: {error_details}")
+        return jsonify(error_details), 500
+
+
+@api.route('/health', methods=['GET'])
+def health_check():
+    """
+    Health check endpoint for monitoring and deployment verification.
+    
+    Returns:
+        JSON response with application status and basic information
+    """
+    try:
+        # Check database connection
+        db_status = "healthy"
+        try:
+            db.session.execute("SELECT 1")
+            db.session.commit()
+        except Exception as e:
+            db_status = f"error: {str(e)}"
+        
+        # Get basic application info
+        health_info = {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "application": "ZIMRA API Service",
+            "version": "1.0.0",
+            "database": db_status,
+            "environment": current_app.config.get('ENV', 'production')
+        }
+        
+        return jsonify(health_info), 200
+        
+    except Exception as e:
+        error_info = {
+            "status": "unhealthy",
+            "timestamp": datetime.now().isoformat(),
+            "error": str(e),
+            "application": "ZIMRA API Service"
+        }
+        current_app.logger.error(f"Health check failed: {str(e)}")
+        return jsonify(error_info), 500

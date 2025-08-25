@@ -70,7 +70,7 @@ class DeviceConfig(db.Model):
 class Invoice(db.Model):
     __tablename__ = 'invoice'
     id = db.Column(db.Integer, primary_key=True)
-    invoice_id = db.Column(db.String(100), unique=True, nullable=False)
+    invoice_id = db.Column(db.String(100), nullable=False)
     device_id = db.Column(db.String(50), nullable=False)
     receipt_currency = db.Column(db.String(10), nullable=False)
     money_type = db.Column(db.String(20), nullable=False)
@@ -105,6 +105,11 @@ class Invoice(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Composite unique constraint to prevent duplicates based on device_id and invoice_id
+    __table_args__ = (
+        db.UniqueConstraint('device_id', 'invoice_id', name='uq_device_invoice'),
+    )
 
 
 class InvoiceLineItem(db.Model):

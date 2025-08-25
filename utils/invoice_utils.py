@@ -5,6 +5,7 @@ from datetime import datetime
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from app.models import Invoice, InvoiceLineItem, DeviceBranchAddress, DeviceBranchContact, DeviceConfig, FiscalDay
+from app.config import zimra_config
 from app import db
 
 
@@ -20,7 +21,18 @@ class ReceiptDeviceSignature:
     def sign_data(self) -> str:
         """Sign the data and return base64 encoded signature"""
         if self._signature is None:
-            signature = self.private_key.sign(
+            # Support both PEM string/bytes and already-loaded key objects
+            if hasattr(self.private_key, "sign"):
+                key = self.private_key
+            else:
+                if isinstance(self.private_key, str):
+                    key_bytes = self.private_key.encode('utf-8')
+                else:
+                    key_bytes = self.private_key  # assume bytes
+                key = serialization.load_pem_private_key(key_bytes, password=None)
+
+            # Sign data with SHA256withRSA
+            signature = key.sign(
                 self.string_to_sign.encode('utf-8'),
                 padding.PKCS1v15(),
                 hashes.SHA256()
@@ -31,9 +43,10 @@ class ReceiptDeviceSignature:
     def get_hash(self) -> str:
         """Get the hash of the string that was signed"""
         if self._hash is None:
-            hash_obj = hashes.Hash(hashes.SHA256())
-            hash_obj.update(self.string_to_sign.encode('utf-8'))
-            hash_value = hash_obj.finalize()
+            # Calculate SHA256 hash and return base64 encoded string (same as Django implementation)
+            digest = hashes.Hash(hashes.SHA256())
+            digest.update(self.string_to_sign.encode('utf-8'))
+            hash_value = digest.finalize()
             self._hash = base64.b64encode(hash_value).decode('utf-8')
         return self._hash
 
@@ -53,6 +66,24 @@ def invoice_exists(device_id: str, invoice_id: str) -> bool:
     return Invoice.query.filter_by(device_id=device_id, invoice_id=invoice_id).first() is not None
 
 
+def get_existing_invoice_info(device_id: str, invoice_id: str) -> dict:
+    """Get information about an existing invoice for duplicate detection"""
+    invoice = Invoice.query.filter_by(device_id=device_id, invoice_id=invoice_id).first()
+    if invoice:
+        return {
+            "exists": True,
+            "invoice_id": invoice.invoice_id,
+            "device_id": invoice.device_id,
+            "receipt_type": invoice.receipt_type,
+            "receipt_total": float(invoice.receipt_total) if invoice.receipt_total else 0,
+            "is_fiscalized": invoice.is_fiscalized,
+            "created_at": invoice.created_at.isoformat() if invoice.created_at else None,
+            "zimra_receipt_number": invoice.zimra_receipt_number,
+            "fiscal_day_number": invoice.fiscal_day_number
+        }
+    return {"exists": False}
+
+
 def get_fiscal_day_counter(device_id: str, fiscal_open_date_time: str) -> int:
     """Get the current fiscal day counter for a device"""
     # This is a simplified version - you might need to implement based on your business logic
@@ -61,8 +92,14 @@ def get_fiscal_day_counter(device_id: str, fiscal_open_date_time: str) -> int:
 
 def get_global_number(device_id: str) -> int:
     """Get the global number for a device - simple approach"""
-    # Find the latest invoice for this device
-    latest_invoice = Invoice.query.filter_by(device_id=device_id).order_by(Invoice.receipt_global_no.desc()).first()
+    # Find the latest invoice for this device that has a non-null global number
+    latest_invoice = (
+        Invoice.query
+        .filter_by(device_id=device_id)
+        .filter(Invoice.receipt_global_no != None)
+        .order_by(Invoice.receipt_global_no.desc())
+        .first()
+    )
     
     if latest_invoice and latest_invoice.receipt_global_no is not None:
         return latest_invoice.receipt_global_no
@@ -81,8 +118,14 @@ def increment_global_number(device_id: str) -> int:
     """
     from flask import current_app
     
-    # Find the latest invoice for this device
-    latest_invoice = Invoice.query.filter_by(device_id=device_id).order_by(Invoice.receipt_global_no.desc()).first()
+    # Find the latest invoice for this device that has a non-null global number
+    latest_invoice = (
+        Invoice.query
+        .filter_by(device_id=device_id)
+        .filter(Invoice.receipt_global_no != None)
+        .order_by(Invoice.receipt_global_no.desc())
+        .first()
+    )
     
     if latest_invoice and latest_invoice.receipt_global_no is not None:
         # Get the last global number and increment by 1
@@ -156,12 +199,7 @@ def calculate_tax_summary(receipt_lines: list) -> dict:
         'D': '5'     # 5% tax
     }
     
-    tax_summary = {
-        '15': {'taxCode': 'C', 'taxPercent': 15.0, 'taxID': 3, 'taxAmount': 0.0, 'salesAmountWithTax': 0.0},
-        '0': {'taxCode': 'B', 'taxPercent': 0.0, 'taxID': 2, 'taxAmount': 0.0, 'salesAmountWithTax': 0.0},
-        '-1': {'taxCode': "A", 'taxPercent': 0.0, 'taxID': 1, 'taxAmount': 0.0, 'salesAmountWithTax': 0.0},  # Exempt
-        '5': {'taxCode': 'D', 'taxPercent': 5.0, 'taxID': 514, 'taxAmount': 0.0, 'salesAmountWithTax': 0.0}
-    }
+    tax_summary = zimra_config.get_tax_mapping()
     
     for line in receipt_lines:
         original_tax_code = str(line.get('taxCode', '15'))
@@ -216,15 +254,8 @@ def get_tax_percentage(tax_code: str) -> float:
 
 
 def get_tax_id(tax_code: str) -> int:
-    """Get tax ID for a tax code"""
-    tax_ids = {
-        'A': 1,
-        'B': 2,
-        'C': 3,
-        'D': 514,
-
-    }
-    return tax_ids.get(tax_code.upper(), 1)
+    """Get tax ID for a tax code using configuration"""
+    return zimra_config.get_tax_id(tax_code)
 
 
 def create_invoice_line_items(invoice_id: int, receipt_lines: list) -> list:
@@ -494,11 +525,11 @@ def generate_close_day_payload(device_id: str, fiscal_day_no: int) -> dict:
         if tax_data['value'] > 0:  # Only include if there are sales
             fiscal_day_counters.append({
                 'fiscalCounterType': 'SaleByTax',
-                'fiscalCounterTaxPercent': tax_data['taxPercent'],
-                'fiscalCounterTaxID': tax_data['taxID'],
                 'fiscalCounterCurrency': tax_data['currency'],
-                'fiscalCounterValue': round(tax_data['value'], 2),
-                'fiscalCounterMoneyType': 'CASH'  # Default, could be enhanced
+                'fiscalCounterTaxPercent': int(tax_data['taxPercent']) if tax_data['taxPercent'] is not None and float(tax_data['taxPercent']).is_integer() else tax_data['taxPercent'],
+                'fiscalCounterTaxID': tax_data['taxID'],
+                'fiscalCounterMoneyType': None,
+                'fiscalCounterValue': round(tax_data['value'], 2)
             })
     
     # Add balance counters
@@ -506,11 +537,9 @@ def generate_close_day_payload(device_id: str, fiscal_day_no: int) -> dict:
         if balance_data['value'] > 0:  # Only include if there are sales
             fiscal_day_counters.append({
                 'fiscalCounterType': 'BalanceByMoneyType',
-                'fiscalCounterTaxPercent': None,
-                'fiscalCounterTaxID': None,
                 'fiscalCounterCurrency': balance_data['currency'],
-                'fiscalCounterValue': round(balance_data['value'], 2),
-                'fiscalCounterMoneyType': balance_data['moneyType']
+                'fiscalCounterMoneyType': balance_data['moneyType'],
+                'fiscalCounterValue': round(balance_data['value'], 2)
             })
     
     # Calculate total receipt counter from all invoices
@@ -536,7 +565,7 @@ def test_qr_string_generation():
     """
     # Example values
     device_id = "26428"
-    qr_url = "https://fdmstest.zimra.co.zw"
+    qr_url = zimra_config.qr_url
     receipt_date = "2024-02-23"  # YYYY-MM-DD format
     receipt_global_no = 13
     receipt_signature = "base64_encoded_signature_here"  # This would be the actual signature

@@ -341,7 +341,7 @@ def test_template():
         'created_at': '2024-01-15 14:30:00',
         'is_fiscalized': True,
         'receipt_type': 'SALE',
-        'money_type': 'CASH',
+        'money_type': 'Cash',
         'receipt_counter': 1,
         'receipt_global_no': 1001,
         'fiscal_day_number': 'FD-2024-001',
